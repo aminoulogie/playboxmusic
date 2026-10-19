@@ -9,7 +9,8 @@ struct MusicLibraryView: View {
         let needle = filter.trimmingCharacters(in: .whitespaces)
         guard !needle.isEmpty else { return library.tracks }
         return library.tracks.filter {
-            $0.title.localizedCaseInsensitiveContains(needle) || $0.folder.localizedCaseInsensitiveContains(needle)
+            library.title(of: $0).localizedCaseInsensitiveContains(needle)
+                || library.subtitle(of: $0).localizedCaseInsensitiveContains(needle)
         }
     }
 
@@ -17,10 +18,11 @@ struct MusicLibraryView: View {
         List {
             ForEach(Array(visible.enumerated()), id: \.element.id) { offset, track in
                 Button { player.play(visible, startAt: offset) } label: {
-                    HStack {
+                    HStack(spacing: 12) {
+                        ArtworkThumbnail(track: track, size: 46)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(track.title).font(.subheadline.weight(.semibold)).lineLimit(1)
-                            Text("\(track.folder) · \(track.fileExtension)")
+                            Text(library.title(of: track)).font(.subheadline.weight(.semibold)).lineLimit(1)
+                            Text("\(library.subtitle(of: track)) · \(track.fileExtension)")
                                 .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                         }
                         Spacer()

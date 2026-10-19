@@ -25,8 +25,11 @@ struct MusicContentView: View {
             NavigationStack { MusicAccountView() }
                 .tabItem { Label("Account", systemImage: "person.crop.circle") }
         }
+        .preferredColorScheme(.dark)
         .task {
-            client.onDownloadFinished = { url, play in
+            player.metaProvider = { [library] track in library.meta(for: track) }
+            client.onDownloadFinished = { url, play, meta in
+                if let meta { library.setMeta(meta, for: url) }
                 library.reload()
                 guard play else { return }
                 let tracks = library.tracks
@@ -60,15 +63,23 @@ private struct MiniPlayerInset: ViewModifier {
 
     func body(content: Content) -> some View {
         content.safeAreaInset(edge: .bottom, spacing: 0) {
-            if let track = player.current {
+            if player.current != nil {
                 Button { showNowPlaying = true } label: {
                     HStack(spacing: 12) {
-                        Image(systemName: "music.note")
-                            .frame(width: 40, height: 40)
-                            .background(.tint.opacity(0.2), in: RoundedRectangle(cornerRadius: 8))
+                        Group {
+                            if let artwork = player.artwork {
+                                Image(uiImage: artwork).resizable().scaledToFill()
+                            } else {
+                                Image(systemName: "music.note")
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                    .background(Color(white: 0.16))
+                            }
+                        }
+                        .frame(width: 42, height: 42)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(track.title).font(.subheadline.weight(.semibold)).lineLimit(1)
-                            Text(track.folder).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            Text(player.title).font(.subheadline.weight(.semibold)).lineLimit(1)
+                            Text(player.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                         }
                         Spacer(minLength: 0)
                         Button { player.togglePlayback() } label: {
@@ -85,7 +96,16 @@ private struct MiniPlayerInset: ViewModifier {
                     }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 8)
-                    .background(.bar)
+                    .background {
+                        ZStack {
+                            Color.black
+                            // Faint tint from the cover, like the full player.
+                            if let artwork = player.artwork {
+                                Image(uiImage: artwork).resizable().scaledToFill().blur(radius: 30).opacity(0.3)
+                            }
+                        }
+                        .clipped()
+                    }
                     .overlay(alignment: .top) {
                         GeometryReader { proxy in
                             Rectangle().fill(.tint).frame(width: proxy.size.width * player.progress, height: 2)

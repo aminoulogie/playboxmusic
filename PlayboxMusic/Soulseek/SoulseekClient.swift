@@ -24,8 +24,17 @@ final class SoulseekClient: ObservableObject {
     @Published private(set) var transfers: [SlskTransfer] = []
     @Published private(set) var listenPort: UInt16?
 
-    /// Called with the finished file and whether the user asked to play it.
-    var onDownloadFinished: ((URL, Bool) -> Void)?
+    /// Catalog-driven lookups ("GET" buttons), keyed by song or album.
+    enum FetchState: Equatable {
+        case searching
+        case downloading([UUID])
+        case notFound
+    }
+
+    @Published private(set) var fetches: [String: FetchState] = [:]
+
+    /// Called with the finished file, whether to play it, and catalog details.
+    var onDownloadFinished: ((URL, Bool, TrackMeta?) -> Void)?
 
     let downloadsDirectory: URL
 
@@ -41,6 +50,8 @@ final class SoulseekClient: ObservableObject {
     private var username = ""
     private var searchToken: UInt32?
     private var searchTimeout: Task<Void, Never>?
+    private var collectors: [UInt32: [SlskSearchResult]] = [:]
+    private var transferMeta: [UUID: TrackMeta] = [:]
     private var peers: [String: SlskSocket] = [:]
     private var addressWaiters: [String: [CheckedContinuation<(String, UInt16)?, Never>]] = [:]
     private var pierceWaiters: [UInt32: CheckedContinuation<SlskSocket?, Never>] = [:]
@@ -176,20 +187,117 @@ final class SoulseekClient: ObservableObject {
 
     // MARK: Downloads
 
-    func download(_ result: SlskSearchResult, play: Bool) {
+    @discardableResult
+    func download(_ result: SlskSearchResult, play: Bool, meta: TrackMeta? = nil) -> UUID {
         if let index = transfers.firstIndex(where: { $0.result.id == result.id && $0.state.isActive }) {
             transfers[index].playWhenFinished = transfers[index].playWhenFinished || play
-            return
+            return transfers[index].id
         }
         let transfer = SlskTransfer(result: result, size: result.size, playWhenFinished: play)
         transfers.insert(transfer, at: 0)
+        if let meta { transferMeta[transfer.id] = meta }
         Task { await requestDownload(transfer.id) }
+        return transfer.id
     }
 
-    func retry(_ id: UUID) {
-        guard let transfer = transfers.first(where: { $0.id == id }) else { return }
+    @discardableResult
+    func retry(_ id: UUID) -> UUID? {
+        guard let transfer = transfers.first(where: { $0.id == id }) else { return nil }
         transfers.removeAll { $0.id == id }
-        download(transfer.result, play: transfer.playWhenFinished)
+        let newID = download(transfer.result, play: transfer.playWhenFinished, meta: transferMeta.removeValue(forKey: id))
+        for (key, state) in fetches {
+            if case .downloading(let ids) = state, ids.contains(id) {
+                fetches[key] = .downloading(ids.map { $0 == id ? newID : $0 })
+            }
+        }
+        return newID
+    }
+
+    // MARK: Catalog fetches
+
+    /// Searches Soulseek for one song and downloads the best matching file.
+    func fetchSong(key: String, artist: String?, title: String, durationSeconds: Int?, meta: TrackMeta, play: Bool) async {
+        let query = MusicText.clean([artist, title].compactMap { $0 }.joined(separator: " "))
+        let candidates = await collect(key: key, query: query) { results in
+            Self.bestSong(in: results, durationSeconds: durationSeconds) != nil && results.count > 30
+        }
+        guard let best = Self.bestSong(in: candidates, durationSeconds: durationSeconds) else {
+            fetches[key] = .notFound
+            return
+        }
+        fetches[key] = .downloading([download(best, play: play, meta: meta)])
+    }
+
+    /// Finds the shared folder that best matches an album and downloads all of it.
+    func fetchAlbum(key: String, artist: String?, album: String, trackCount: Int?, meta: TrackMeta, play: Bool) async {
+        let query = MusicText.clean([artist, album].compactMap { $0 }.joined(separator: " "))
+        let candidates = await collect(key: key, query: query) { _ in false }
+        guard let files = Self.bestFolder(in: candidates, trackCount: trackCount) else {
+            fetches[key] = .notFound
+            return
+        }
+        let ids = files.enumerated().map { index, file in
+            var trackMeta = meta
+            trackMeta.title = MusicText.clean(file.title).isEmpty ? file.title : MusicText.clean(file.title)
+            return download(file, play: play && index == 0, meta: trackMeta)
+        }
+        fetches[key] = .downloading(ids)
+    }
+
+    private func collect(key: String, query: String, enough: ([SlskSearchResult]) -> Bool) async -> [SlskSearchResult] {
+        guard let server, !query.isEmpty else {
+            fetches[key] = .notFound
+            return []
+        }
+        fetches[key] = .searching
+        let token = UInt32.random(in: 1...UInt32.max)
+        collectors[token] = []
+        try? await server.send(SlskWriter.message(code: 26) { $0.u32(token); $0.string(query) })
+        let started = Date()
+        while Date().timeIntervalSince(started) < 9 {
+            try? await Task.sleep(for: .milliseconds(400))
+            if Date().timeIntervalSince(started) > 3, enough(collectors[token] ?? []) { break }
+        }
+        return collectors.removeValue(forKey: token) ?? []
+    }
+
+    private static func score(_ result: SlskSearchResult) -> Double {
+        var score = result.freeSlots ? 1000.0 : 0
+        score -= Double(min(result.queueLength, 100)) * 5
+        switch result.fileExtension {
+        case "flac", "alac", "wav", "aiff", "aif": score += 200
+        case "mp3", "m4a", "aac", "ogg", "opus":
+            let bitrate = Double(result.bitrate ?? 0)
+            score += bitrate >= 320 ? 160 : bitrate >= 256 ? 120 : bitrate >= 192 ? 60 : 0
+        default: score -= 100
+        }
+        return score + log10(Double(max(result.uploadSpeed, 1))) * 20
+    }
+
+    private static func bestSong(in results: [SlskSearchResult], durationSeconds: Int?) -> SlskSearchResult? {
+        results
+            .filter(\.isAudio)
+            .filter { result in
+                guard let expected = durationSeconds, let actual = result.duration, actual > 0 else { return true }
+                return abs(Int(actual) - expected) <= 6
+            }
+            .max { score($0) < score($1) }
+    }
+
+    private static func bestFolder(in results: [SlskSearchResult], trackCount: Int?) -> [SlskSearchResult]? {
+        let folders = Dictionary(grouping: results.filter(\.isAudio)) { result -> String in
+            let path = result.filename.split(whereSeparator: { $0 == "\\" || $0 == "/" }).dropLast().joined(separator: "/")
+            return result.username + "\u{1F}" + path
+        }
+        let minimum = max(1, Int(Double(trackCount ?? 1) * 0.7))
+        return folders.values
+            .filter { $0.count >= minimum }
+            .max { lhs, rhs in
+                let left = Double(min(lhs.count, trackCount ?? lhs.count)) * 50 + score(lhs[0])
+                let right = Double(min(rhs.count, trackCount ?? rhs.count)) * 50 + score(rhs[0])
+                return left < right
+            }?
+            .sorted { $0.filename.localizedStandardCompare($1.filename) == .orderedAscending }
     }
 
     func remove(_ id: UUID) {
@@ -518,8 +626,10 @@ final class SoulseekClient: ObservableObject {
 
     private func acceptSearchResponse(_ data: Data) {
         var reader = SlskReader(data)
-        guard let user = try? reader.string(), let token = try? reader.u32(), token == searchToken,
-              let count = try? reader.u32(), results.count < Self.maxResults else { return }
+        guard let user = try? reader.string(), let token = try? reader.u32(),
+              let count = try? reader.u32() else { return }
+        let collecting = collectors[token] != nil
+        guard collecting || (token == searchToken && results.count < Self.maxResults) else { return }
 
         var files: [(String, UInt64, [UInt32: UInt32])] = []
         for _ in 0..<min(count, 5000) {
@@ -553,7 +663,11 @@ final class SoulseekClient: ObservableObject {
                 queueLength: queue
             )
         }
-        results.append(contentsOf: parsed.prefix(Self.maxResults - results.count))
+        if collecting {
+            collectors[token]?.append(contentsOf: parsed.prefix(3000))
+        } else {
+            results.append(contentsOf: parsed.prefix(Self.maxResults - results.count))
+        }
     }
 
     // MARK: File transfers
@@ -591,7 +705,7 @@ final class SoulseekClient: ObservableObject {
                 $0.state = .completed(destination)
             }
             let play = transfers.first(where: { $0.id == id })?.playWhenFinished ?? false
-            onDownloadFinished?(destination, play)
+            onDownloadFinished?(destination, play, transferMeta.removeValue(forKey: id))
         } catch {
             socket.close()
             if let transferID {

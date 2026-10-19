@@ -12,17 +12,53 @@ struct Track: Identifiable, Hashable {
     var fileExtension: String { url.pathExtension.uppercased() }
 }
 
+/// Catalog details saved for a downloaded file (title, artist, album, cover).
+struct TrackMeta: Codable, Hashable, Sendable {
+    var title: String
+    var artist: String?
+    var album: String?
+    var artworkURL: URL?
+}
+
 /// Lists audio files downloaded into Documents/Music (also visible in the Files app).
 @MainActor
 final class MusicLibrary: ObservableObject {
     @Published private(set) var tracks: [Track] = []
+    @Published private(set) var metadata: [String: TrackMeta] = [:]
     let root: URL
+
+    private var metadataURL: URL { root.appendingPathComponent(".playbox-metadata.json") }
 
     init() {
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         root = documents.appendingPathComponent("Music", isDirectory: true)
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        if let data = try? Data(contentsOf: metadataURL),
+           let saved = try? JSONDecoder().decode([String: TrackMeta].self, from: data) {
+            metadata = saved
+        }
         reload()
+    }
+
+    func meta(for track: Track) -> TrackMeta? { metadata[key(for: track.url)] }
+
+    func setMeta(_ meta: TrackMeta, for url: URL) {
+        metadata[key(for: url)] = meta
+        if let data = try? JSONEncoder().encode(metadata) { try? data.write(to: metadataURL, options: .atomic) }
+    }
+
+    func title(of track: Track) -> String { meta(for: track)?.title ?? track.title }
+
+    func subtitle(of track: Track) -> String {
+        guard let meta = meta(for: track) else { return track.folder }
+        return [meta.artist, meta.album].compactMap { $0 }.joined(separator: " — ")
+    }
+
+    /// Keys are relative to the Music folder because the app container path changes.
+    private func key(for url: URL) -> String {
+        let base = root.resolvingSymlinksInPath().path + "/"
+        let path = url.resolvingSymlinksInPath().path
+        return path.hasPrefix(base) ? String(path.dropFirst(base.count)) : path
     }
 
     func reload() {
@@ -52,6 +88,7 @@ final class MusicLibrary: ObservableObject {
 
     func delete(_ track: Track) {
         try? FileManager.default.removeItem(at: track.url)
+        metadata[key(for: track.url)] = nil
         reload()
     }
 }

@@ -5,6 +5,16 @@ struct MusicSearchView: View {
     @State private var query = ""
     @State private var audioOnly = true
     @State private var sort: Sort = .best
+    @State private var mode: Mode = .catalog
+    @State private var albums: [ITunesItem] = []
+    @State private var songs: [ITunesItem] = []
+    @State private var catalogLoading = false
+
+    enum Mode: String, CaseIterable, Identifiable {
+        case catalog = "Catalog"
+        case soulseek = "Soulseek"
+        var id: String { rawValue }
+    }
 
     enum Sort: String, CaseIterable, Identifiable {
         case best = "Best match"
@@ -34,17 +44,28 @@ struct MusicSearchView: View {
 
     var body: some View {
         List {
+            Section {
+                Picker("Search", selection: $mode) {
+                    ForEach(Mode.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets())
+            }
+
             if !client.isConnected {
                 Section {
                     NavigationLink {
                         MusicAccountView()
                     } label: {
-                        Label("Sign in to Soulseek to search", systemImage: "person.crop.circle.badge.exclamationmark")
+                        Label("Sign in to Soulseek to download", systemImage: "person.crop.circle.badge.exclamationmark")
                     }
                 }
             }
 
-            if !client.results.isEmpty || client.isSearching {
+            if mode == .catalog {
+                CatalogResultsView(albums: albums, songs: songs)
+            } else if !client.results.isEmpty || client.isSearching {
                 Section {
                     ForEach(visibleResults) { result in
                         ResultRow(result: result)
@@ -61,7 +82,17 @@ struct MusicSearchView: View {
             }
         }
         .overlay {
-            if client.isConnected && client.results.isEmpty && !client.isSearching {
+            if mode == .catalog {
+                if catalogLoading && albums.isEmpty && songs.isEmpty {
+                    ProgressView()
+                } else if albums.isEmpty && songs.isEmpty {
+                    ContentUnavailableView(
+                        "Find Music",
+                        systemImage: "music.magnifyingglass",
+                        description: Text("Search albums and songs, then tap GET to download the best copy from Soulseek.")
+                    )
+                }
+            } else if client.isConnected && client.results.isEmpty && !client.isSearching {
                 ContentUnavailableView(
                     "Search Soulseek",
                     systemImage: "music.magnifyingglass",
@@ -73,7 +104,29 @@ struct MusicSearchView: View {
         .searchable(text: $query, prompt: "Artist, album or track")
         .autocorrectionDisabled()
         .textInputAutocapitalization(.never)
-        .onSubmit(of: .search) { Task { await client.search(query) } }
+        .onSubmit(of: .search) {
+            if mode == .soulseek { Task { await client.search(query) } }
+        }
+        // The catalog is fast, so it searches as you type.
+        .task(id: mode == .catalog ? query : "") {
+            guard mode == .catalog else { return }
+            let term = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard term.count >= 2 else {
+                albums = []
+                songs = []
+                return
+            }
+            do { try await Task.sleep(for: .milliseconds(300)) } catch { return }
+            catalogLoading = true
+            defer { catalogLoading = false }
+            async let foundAlbums = try? ITunesCatalog.search(term, entity: "album", limit: 20)
+            async let foundSongs = try? ITunesCatalog.search(term, entity: "song", limit: 40)
+            let (newAlbums, newSongs) = await (foundAlbums ?? [], foundSongs ?? [])
+            guard !Task.isCancelled else { return }
+            albums = newAlbums
+            songs = newSongs
+        }
+        .navigationDestination(for: ITunesItem.self) { AlbumDetailView(album: $0) }
         .toolbar {
             Menu {
                 Toggle("Audio files only", isOn: $audioOnly)
@@ -84,6 +137,8 @@ struct MusicSearchView: View {
                 Image(systemName: "line.3.horizontal.decrease.circle")
             }
             .accessibilityLabel("Filter and sort")
+            .opacity(mode == .soulseek ? 1 : 0)
+            .disabled(mode != .soulseek)
         }
     }
 

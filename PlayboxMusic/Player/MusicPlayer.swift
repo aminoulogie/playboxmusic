@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import MediaPlayer
+import UIKit
 import VLCKit
 
 /// Plays local audio with VLCKit (FLAC, Opus, Ogg, APE and more) and
@@ -13,6 +14,11 @@ final class MusicPlayer: ObservableObject {
     @Published private(set) var duration: Double = 0
     @Published private(set) var queue: [Track] = []
     @Published private(set) var index = 0
+    @Published private(set) var artwork: UIImage?
+    @Published private(set) var currentMeta: TrackMeta?
+
+    /// Supplies saved catalog details (title, artist, cover) for a track.
+    var metaProvider: ((Track) -> TrackMeta?)?
 
     private var player = VLCMediaPlayer()
     private var pollTask: Task<Void, Never>?
@@ -79,6 +85,9 @@ final class MusicPlayer: ObservableObject {
         try? AVAudioSession.sharedInstance().setActive(true)
         player.media = media
         current = track
+        currentMeta = metaProvider?(track)
+        artwork = nil
+        loadArtwork(for: track)
         elapsed = 0
         duration = 0
         startedPlaying = false
@@ -112,18 +121,42 @@ final class MusicPlayer: ObservableObject {
         updateNowPlaying()
     }
 
+    var title: String { currentMeta?.title ?? current?.title ?? "Not Playing" }
+
+    var subtitle: String {
+        if let meta = currentMeta, meta.artist != nil || meta.album != nil {
+            return [meta.artist, meta.album].compactMap { $0 }.joined(separator: " — ")
+        }
+        return current?.folder ?? ""
+    }
+
+    private func loadArtwork(for track: Track) {
+        let meta = currentMeta
+        Task { [weak self] in
+            let image = await ArtworkResolver.shared.image(for: track, meta: meta)
+            guard let self, self.current == track else { return }
+            self.artwork = image
+            self.updateNowPlaying()
+        }
+    }
+
     private func updateNowPlaying() {
-        guard let current else {
+        guard current != nil else {
             MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
             return
         }
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = [
-            MPMediaItemPropertyTitle: current.title,
-            MPMediaItemPropertyAlbumTitle: current.folder,
+        var info: [String: Any] = [
+            MPMediaItemPropertyTitle: title,
             MPMediaItemPropertyPlaybackDuration: duration,
             MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsed,
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0
         ]
+        if let artist = currentMeta?.artist { info[MPMediaItemPropertyArtist] = artist }
+        info[MPMediaItemPropertyAlbumTitle] = currentMeta?.album ?? current?.folder
+        if let artwork {
+            info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: artwork.size) { _ in artwork }
+        }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
     private func configureRemoteCommands() {
