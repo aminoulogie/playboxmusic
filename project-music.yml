@@ -24,6 +24,8 @@ targets:
       properties:
         CFBundleDisplayName: Playbox Music
         UIBackgroundModes: [audio]
+        # Allow 120 Hz on ProMotion iPhones.
+        CADisableMinimumFrameDurationOnPhone: true
         # Router port mapping (UPnP) uses plain HTTP on the local network.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true

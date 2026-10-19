@@ -30,6 +30,14 @@ enum FadeCurve: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// How the two songs are blended, like Spotify's mix transitions.
+enum TransitionStyle: String, Codable, CaseIterable, Identifiable {
+    case bassSwap = "Bass swap"
+    case filterSweep = "Filter sweep"
+    case crossfade = "Fade"
+    var id: String { rawValue }
+}
+
 /// A saved override for one specific song pair (Spotify-style transition editor).
 struct TransitionOverride: Codable, Equatable {
     /// Seconds into the outgoing song where the blend starts.
@@ -38,6 +46,7 @@ struct TransitionOverride: Codable, Equatable {
     var entry: Double
     var length: Double
     var curve: FadeCurve
+    var style: TransitionStyle?
 }
 
 /// The concrete plan for one transition.
@@ -46,6 +55,7 @@ struct TransitionPlan: Equatable {
     var entry: Double
     var length: Double
     var curve: FadeCurve
+    var style: TransitionStyle
     /// Gain trims in dB to even out loudness.
     var outGain: Float
     var inGain: Float
@@ -58,6 +68,7 @@ final class MixSettings: ObservableObject {
     @Published var mode: MixMode { didSet { save() } }
     @Published var manualLength: Double { didSet { save() } }
     @Published var curve: FadeCurve { didSet { save() } }
+    @Published var style: TransitionStyle { didSet { save() } }
     /// Manual: seconds before the end of the song where the blend starts.
     @Published var startBeforeEnd: Double { didSet { save() } }
     @Published var skipSilence: Bool { didSet { save() } }
@@ -71,6 +82,7 @@ final class MixSettings: ObservableObject {
         mode = MixMode(rawValue: defaults.string(forKey: "mix.mode") ?? "") ?? .auto
         manualLength = defaults.object(forKey: "mix.length") as? Double ?? 6
         curve = FadeCurve(rawValue: defaults.string(forKey: "mix.curve") ?? "") ?? .smooth
+        style = TransitionStyle(rawValue: defaults.string(forKey: "mix.style") ?? "") ?? .bassSwap
         startBeforeEnd = defaults.object(forKey: "mix.startBeforeEnd") as? Double ?? 6
         skipSilence = defaults.object(forKey: "mix.skipSilence") as? Bool ?? true
         matchVolume = defaults.object(forKey: "mix.matchVolume") as? Bool ?? true
@@ -99,7 +111,8 @@ final class MixSettings: ObservableObject {
 
         if let custom = overrides[Self.pairKey(from, to)] {
             return TransitionPlan(mixStart: custom.mixStart, entry: custom.entry, length: custom.length,
-                                  curve: custom.curve, outGain: gains.0, inGain: gains.1, inRate: 1)
+                                  curve: custom.curve, style: custom.style ?? style,
+                                  outGain: gains.0, inGain: gains.1, inRate: tempoRatio(out, incoming) ?? 1)
         }
 
         switch mode {
@@ -108,29 +121,42 @@ final class MixSettings: ObservableObject {
         case .manual:
             let length = manualLength
             let start = max(0, end - max(startBeforeEnd, length))
-            return TransitionPlan(mixStart: start, entry: entry, length: length, curve: curve,
+            return TransitionPlan(mixStart: start, entry: entry, length: length, curve: curve, style: style,
                                   outGain: gains.0, inGain: gains.1, inRate: 1)
         case .auto:
-            // Blend over the natural outro, like Spotify's automix: 4–12 s.
-            var length = 6.0
-            if let out { length = min(12, max(4, end - out.outroStart)) }
+            // Blend over the natural outro like Spotify's mixes: 6–16 s.
+            var length = 10.0
+            if let out { length = min(16, max(6, end - out.outroStart)) }
             var start = max(0, end - length)
             var entryPoint = entry
             var rate: Float = 1
-            if matchBeats, let outBPM = out?.bpm, let inBPM = incoming?.bpm {
-                let ratio = outBPM / inBPM
-                if ratio > 0.94 && ratio < 1.06 {
-                    rate = Float(ratio)
-                    let period = 60 / outBPM
-                    if let beat = out?.firstBeat {
-                        start = beat + (((start - beat) / period).rounded()) * period
-                    }
-                    if let inBeat = incoming?.firstBeat, inBeat >= entry { entryPoint = inBeat }
+            var blend = style
+            if matchBeats, let ratio = tempoRatio(out, incoming), let outBPM = out?.bpm {
+                rate = ratio
+                // Snap the blend to a 4-beat phrase so the beats line up.
+                let bar = 4 * 60 / outBPM
+                if let beat = out?.firstBeat {
+                    start = beat + (((start - beat) / bar).rounded()) * bar
+                    length = max(bar * 2, (length / bar).rounded() * bar)
                 }
+                if let inBeat = incoming?.firstBeat, inBeat >= entry { entryPoint = inBeat }
+            } else if blend == .bassSwap {
+                // Without matching beats, two basslines clash less in a sweep.
+                blend = .filterSweep
             }
             return TransitionPlan(mixStart: max(0, start), entry: entryPoint, length: length, curve: .smooth,
-                                  outGain: gains.0, inGain: gains.1, inRate: rate)
+                                  style: blend, outGain: gains.0, inGain: gains.1, inRate: rate)
         }
+    }
+
+    /// Playback rate that brings the incoming song to the outgoing tempo,
+    /// when the two are within ±8% (also tries half/double time).
+    func tempoRatio(_ out: TrackAnalysis?, _ incoming: TrackAnalysis?) -> Float? {
+        guard matchBeats || mode == .manual, let a = out?.bpm, let b = incoming?.bpm else { return nil }
+        for candidate in [a / b, a / (b * 2), (a * 2) / b] where candidate > 0.92 && candidate < 1.08 {
+            return Float(candidate)
+        }
+        return nil
     }
 
     /// Gain trims (dB) that bring both songs toward a common loudness.
@@ -148,6 +174,7 @@ final class MixSettings: ObservableObject {
         defaults.set(mode.rawValue, forKey: "mix.mode")
         defaults.set(manualLength, forKey: "mix.length")
         defaults.set(curve.rawValue, forKey: "mix.curve")
+        defaults.set(style.rawValue, forKey: "mix.style")
         defaults.set(startBeforeEnd, forKey: "mix.startBeforeEnd")
         defaults.set(skipSilence, forKey: "mix.skipSilence")
         defaults.set(matchVolume, forKey: "mix.matchVolume")

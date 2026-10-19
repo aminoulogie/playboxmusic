@@ -270,8 +270,8 @@ final class SoulseekClient: ObservableObject {
         for files in folders.prefix(3) {
             let ids = files.enumerated().map { index, file in
                 var trackMeta = meta
-                let cleaned = MusicText.clean(file.title)
-                trackMeta.title = cleaned.isEmpty ? file.title : cleaned
+                // Filled from the file's own tags once downloaded.
+                trackMeta.title = ""
                 return download(file, play: play && index == 0, meta: trackMeta)
             }
             fetches[key] = .downloading(ids)

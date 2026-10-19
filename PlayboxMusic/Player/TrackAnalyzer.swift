@@ -42,7 +42,7 @@ actor TrackAnalyzer {
 
     init() {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        directory = caches.appendingPathComponent("Analysis", isDirectory: true)
+        directory = caches.appendingPathComponent("Analysis-v2", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     }
 
@@ -86,6 +86,12 @@ actor TrackAnalyzer {
         envelope.reserveCapacity(Int(Double(file.length) / Double(window)) + 1)
         var sum: Float = 0
         var count: AVAudioFrameCount = 0
+        // A finer 10 ms envelope used only for tempo and beat detection.
+        let fineWindow = max(1, window / 5)
+        var fine: [Float] = []
+        fine.reserveCapacity(envelope.capacity * 5)
+        var fineSum: Float = 0
+        var fineCount: AVAudioFrameCount = 0
         let channels = Int(format.channelCount)
 
         while file.framePosition < file.length {
@@ -97,6 +103,13 @@ actor TrackAnalyzer {
                 sample /= Float(channels)
                 sum += sample * sample
                 count += 1
+                fineSum += sample * sample
+                fineCount += 1
+                if fineCount == fineWindow {
+                    fine.append(level(fineSum / Float(fineCount)))
+                    fineSum = 0
+                    fineCount = 0
+                }
                 if count == window {
                     envelope.append(level(sum / Float(count)))
                     sum = 0
@@ -114,7 +127,7 @@ actor TrackAnalyzer {
         let last = envelope.lastIndex { $0 > silence } ?? (envelope.count - 1)
         let audible = envelope[first...max(first, last)].filter { $0 > -60 }
         let loudness = audible.isEmpty ? -20 : Double(audible.reduce(0, +) / Float(audible.count))
-        let (bpm, beat) = tempo(envelope, from: first)
+        let (bpm, beat) = tempo(fine, from: first * 5, step: TrackAnalysis.windowSeconds / 5)
 
         return TrackAnalysis(
             duration: duration,
@@ -122,7 +135,7 @@ actor TrackAnalyzer {
             musicEnd: min(duration, Double(last + 1) * step),
             loudness: loudness,
             bpm: bpm,
-            firstBeat: beat.map { Double($0) * step },
+            firstBeat: beat,
             envelope: envelope
         )
     }
@@ -131,36 +144,57 @@ actor TrackAnalyzer {
         max(-60, min(0, 10 * log10(max(meanSquare, 1e-12))))
     }
 
-    /// Estimates tempo from the onset envelope by autocorrelation. At 50 ms
-    /// resolution this is approximate; it is only used when two songs' tempos
-    /// are already close.
-    private static func tempo(_ envelope: [Float], from start: Int) -> (Double?, Int?) {
-        let begin = min(envelope.count, start + 200)
-        let end = min(envelope.count, begin + 1200)
-        guard end - begin > 400 else { return (nil, nil) }
+    /// Estimates tempo by autocorrelating an onset (energy rise) curve over
+    /// up to 40 s of music, then finds the first beat on that grid.
+    private static func tempo(_ envelope: [Float], from start: Int, step: Double) -> (Double?, Double?) {
+        let skip = Int(10 / step) // past intros, where the beat is often absent
+        let begin = min(envelope.count, start + skip)
+        let end = min(envelope.count, begin + Int(40 / step))
+        guard end - begin > Int(8 / step) else { return (nil, nil) }
         var onset = [Float](repeating: 0, count: end - begin)
         for index in (begin + 1)..<end {
             onset[index - begin] = max(0, envelope[index] - envelope[index - 1])
         }
-        // Lags for 70–180 BPM at 20 windows per second.
-        let minLag = Int((60.0 / 180.0) / TrackAnalysis.windowSeconds)
-        let maxLag = Int((60.0 / 70.0) / TrackAnalysis.windowSeconds)
-        var bestLag = 0
-        var bestScore: Float = 0
+        let mean = onset.reduce(0, +) / Float(onset.count)
+        for index in onset.indices { onset[index] = max(0, onset[index] - mean) }
+
+        // 70–180 BPM.
+        let minLag = Int((60.0 / 180.0) / step)
+        let maxLag = Int((60.0 / 70.0) / step)
+        var scores = [Float](repeating: 0, count: maxLag + 1)
         for lag in minLag...maxLag {
             var score: Float = 0
-            for index in lag..<onset.count { score += onset[index] * onset[index - lag] }
-            score /= Float(onset.count - lag)
-            if score > bestScore {
-                bestScore = score
-                bestLag = lag
+            var index = lag
+            while index < onset.count {
+                score += onset[index] * onset[index - lag]
+                index += 1
             }
+            // Count evidence at 2× and 4× the lag too (bars, not just beats).
+            scores[lag] = score / Float(onset.count - lag)
         }
-        guard bestLag > 0, bestScore > 0.05 else { return (nil, nil) }
-        let bpm = 60.0 / (Double(bestLag) * TrackAnalysis.windowSeconds)
-        let firstOnset = (start..<min(envelope.count - 1, start + 100)).max { lhs, rhs in
-            (envelope[lhs + 1] - envelope[lhs]) < (envelope[rhs + 1] - envelope[rhs])
+        guard let best = (minLag...maxLag).max(by: { scores[$0] < scores[$1] }), scores[best] > 0 else {
+            return (nil, nil)
         }
-        return (bpm, firstOnset)
+        // Parabolic refinement for sub-step precision.
+        var lag = Double(best)
+        if best > minLag, best < maxLag {
+            let a = Double(scores[best - 1]), b = Double(scores[best]), c = Double(scores[best + 1])
+            let denominator = a - 2 * b + c
+            if denominator != 0 { lag += 0.5 * (a - c) / denominator }
+        }
+        var bpm = 60.0 / (lag * step)
+        while bpm < 85 { bpm *= 2 }
+        while bpm > 170 { bpm /= 2 }
+
+        // Beat phase: the offset within one period with the strongest onsets.
+        let period = Int((60.0 / bpm) / step)
+        guard period > 0 else { return (bpm, nil) }
+        var phaseScores = [Float](repeating: 0, count: period)
+        for (index, value) in onset.enumerated() { phaseScores[index % period] += value }
+        let phase = phaseScores.indices.max { phaseScores[$0] < phaseScores[$1] } ?? 0
+        // Project the grid back to the first beat after the music starts.
+        var beatIndex = begin + phase
+        while beatIndex - period >= start { beatIndex -= period }
+        return (bpm, Double(beatIndex) * step)
     }
 }

@@ -42,6 +42,7 @@ struct MusicContentView: View {
             }
             await reconnectIfNeeded()
         }
+        .onChange(of: library.metadata) { _, _ in player.refreshMeta() }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await reconnectIfNeeded() } }
         }
@@ -112,12 +113,7 @@ private struct MiniPlayerInset: ViewModifier {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
                 .background(Color.black)
-                .overlay(alignment: .top) {
-                    GeometryReader { proxy in
-                        Rectangle().fill(.white.opacity(0.85)).frame(width: proxy.size.width * player.progress, height: 2)
-                    }
-                    .frame(height: 2)
-                }
+                .overlay(alignment: .top) { MiniProgressLine(clock: player.clock) }
                 .overlay(alignment: .top) { Divider().opacity(0.4) }
                 .contentShape(Rectangle())
                 .onTapGesture { showNowPlaying = true }
@@ -144,6 +140,21 @@ private struct MiniPlayerInset: ViewModifier {
                 }
             }
         }
+    }
+}
+
+/// Only this line redraws as the song plays, every frame on ProMotion.
+private struct MiniProgressLine: View {
+    @ObservedObject var clock: PlaybackClock
+
+    var body: some View {
+        TimelineView(.animation(paused: !clock.running)) { context in
+            GeometryReader { proxy in
+                let progress = clock.duration > 0 ? min(1, clock.elapsed(at: context.date) / clock.duration) : 0
+                Rectangle().fill(.white.opacity(0.85)).frame(width: proxy.size.width * progress, height: 2)
+            }
+        }
+        .frame(height: 2)
     }
 }
 

@@ -81,7 +81,24 @@ final class MusicLibrary: ObservableObject {
     func meta(for track: Track) -> TrackMeta? { metadata[key(for: track.url)] }
 
     func setMeta(_ meta: TrackMeta, for url: URL) {
+        var meta = meta
+        // Album downloads leave the title empty; fill it from the file's
+        // name now and from its tags as soon as they are read.
+        if meta.title.isEmpty {
+            meta.title = TagReader.parse(url).title
+            Task {
+                let tags = await TagReader.meta(for: url)
+                guard var current = metadata[key(for: url)] else { return }
+                current.title = tags.title
+                metadata[key(for: url)] = current
+                save()
+            }
+        }
         metadata[key(for: url)] = meta
+        save()
+    }
+
+    private func save() {
         if let data = try? JSONEncoder().encode(metadata) { try? data.write(to: metadataURL, options: .atomic) }
     }
 
@@ -89,7 +106,8 @@ final class MusicLibrary: ObservableObject {
 
     func subtitle(of track: Track) -> String {
         guard let meta = meta(for: track) else { return track.folder }
-        return [meta.artist, meta.album].compactMap { $0 }.joined(separator: " — ")
+        let text = [meta.artist, meta.album].compactMap { $0 }.joined(separator: " — ")
+        return text.isEmpty ? track.folder : text
     }
 
     /// Keys are relative to the Music folder because the app container path changes.
@@ -117,6 +135,23 @@ final class MusicLibrary: ObservableObject {
             found.append(Track(url: url, addedAt: values?.contentModificationDate ?? .distantPast))
         }
         tracks = found.sorted { $0.addedAt > $1.addedAt }
+        fillMissingMeta()
+    }
+
+    private var readingTags: Set<String> = []
+
+    /// Reads tags (or parses names) for songs without saved details, so
+    /// every song shows a proper title, artist and album.
+    private func fillMissingMeta() {
+        let missing = tracks.filter { metadata[key(for: $0.url)] == nil && !readingTags.contains(key(for: $0.url)) }
+        guard !missing.isEmpty else { return }
+        missing.forEach { readingTags.insert(key(for: $0.url)) }
+        Task {
+            for track in missing {
+                let meta = await TagReader.meta(for: track.url)
+                setMeta(meta, for: track.url)
+            }
+        }
     }
 
     func track(for url: URL) -> Track {

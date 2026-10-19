@@ -126,10 +126,17 @@ struct MixSettingsForm: View {
         }
 
         if mix.mode == .auto {
-            Section("Automatic") {
+            Section {
+                Picker("Blend style", selection: $mix.style) {
+                    ForEach(TransitionStyle.allCases) { Text($0.rawValue).tag($0) }
+                }
                 Toggle("Skip silence", isOn: $mix.skipSilence)
                 Toggle("Match volume", isOn: $mix.matchVolume)
-                Toggle("Match beats (experimental)", isOn: $mix.matchBeats)
+                Toggle("Match tempo and beats", isOn: $mix.matchBeats)
+            } header: {
+                Text("Automatic")
+            } footer: {
+                Text("Bass swap plays the next song without bass, then swaps basslines halfway, like a DJ. Filter sweep fades the old song out from the bottom up.")
             }
         }
 
@@ -145,6 +152,9 @@ struct MixSettingsForm: View {
                 }
                 Picker("Fade curve", selection: $mix.curve) {
                     ForEach(FadeCurve.allCases) { Text($0.rawValue).tag($0) }
+                }
+                Picker("Blend style", selection: $mix.style) {
+                    ForEach(TransitionStyle.allCases) { Text($0.rawValue).tag($0) }
                 }
                 Toggle("Skip silence", isOn: $mix.skipSilence)
                 Toggle("Match volume", isOn: $mix.matchVolume)
@@ -166,6 +176,7 @@ struct TransitionEditorView: View {
     @State private var entry: Double = 0
     @State private var length: Double = 6
     @State private var curve: FadeCurve = .smooth
+    @State private var style: TransitionStyle = .bassSwap
     @State private var loaded = false
 
     private let windowLength = 40.0
@@ -196,10 +207,13 @@ struct TransitionEditorView: View {
                     Section("Blend") {
                         VStack(alignment: .leading) {
                             Text("Length: \(Int(length)) s")
-                            Slider(value: $length, in: 0...12, step: 0.5)
+                            Slider(value: $length, in: 0...16, step: 0.5)
                         }
                         Picker("Fade curve", selection: $curve) {
                             ForEach(FadeCurve.allCases) { Text($0.rawValue).tag($0) }
+                        }
+                        Picker("Blend style", selection: $style) {
+                            ForEach(TransitionStyle.allCases) { Text($0.rawValue).tag($0) }
                         }
                     }
                     Section {
@@ -245,12 +259,14 @@ struct TransitionEditorView: View {
             entry = custom.entry
             length = custom.length
             curve = custom.curve
+            style = custom.style ?? player.mix.style
         } else if let plan = player.mix.plan(from: pair.from, outValue, to: pair.to, inValue,
                                              outDuration: outValue?.duration ?? 0) {
             mixStart = plan.mixStart
             entry = plan.entry
             length = plan.length
             curve = plan.curve
+            style = plan.style
         } else if let outValue {
             mixStart = max(0, outValue.musicEnd - 6)
             entry = inValue?.leadIn ?? 0
@@ -261,7 +277,7 @@ struct TransitionEditorView: View {
     private func save() {
         guard outgoing != nil, incoming != nil else { return }
         player.mix.setOverride(
-            TransitionOverride(mixStart: mixStart, entry: entry, length: length, curve: curve),
+            TransitionOverride(mixStart: mixStart, entry: entry, length: length, curve: curve, style: style),
             from: pair.from, to: pair.to
         )
     }

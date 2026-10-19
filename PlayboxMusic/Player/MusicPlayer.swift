@@ -11,6 +11,8 @@ private final class AudioDeck {
     let player = AVAudioPlayerNode()
     let timePitch = AVAudioUnitTimePitch()
     let trim = AVAudioUnitEQ(numberOfBands: 0)
+    /// High-pass filter for DJ-style blends (bass swap, filter sweep).
+    let filter = AVAudioUnitEQ(numberOfBands: 1)
     let fader = AVAudioMixerNode()
     private(set) var file: AVAudioFile?
     private(set) var url: URL?
@@ -26,6 +28,7 @@ private final class AudioDeck {
     var isActive: Bool { file != nil && player.isPlaying }
 
     var currentTime: Double {
+        guard file != nil else { return 0 }
         if let pausedAt { return pausedAt }
         guard let nodeTime = player.lastRenderTime, let time = player.playerTime(forNodeTime: nodeTime) else {
             return segmentStart
@@ -34,9 +37,15 @@ private final class AudioDeck {
     }
 
     func attach(to engine: AVAudioEngine, output: AVAudioNode) {
-        [player, timePitch, trim, fader].forEach(engine.attach)
+        [player, timePitch, trim, filter, fader].forEach(engine.attach)
+        let band = filter.bands[0]
+        band.filterType = .highPass
+        band.frequency = 20
+        band.bandwidth = 0.5
+        filter.bypass = true
         engine.connect(timePitch, to: trim, format: nil)
-        engine.connect(trim, to: fader, format: nil)
+        engine.connect(trim, to: filter, format: nil)
+        engine.connect(filter, to: fader, format: nil)
         engine.connect(fader, to: output, format: nil)
     }
 
@@ -69,14 +78,22 @@ private final class AudioDeck {
         player.play()
     }
 
+    /// Sets the high-pass cutoff; below ~25 Hz the filter is bypassed.
+    func setHighPass(_ frequency: Float) {
+        filter.bypass = frequency < 25
+        filter.bands[0].frequency = max(20, frequency)
+    }
+
+    // An idle deck has no connected input; pausing or playing it would
+    // raise an exception, so every transport call checks for a file.
     func pause() {
-        guard pausedAt == nil else { return }
+        guard file != nil, pausedAt == nil else { return }
         pausedAt = currentTime
         player.pause()
     }
 
     func resume() {
-        guard pausedAt != nil else { return }
+        guard file != nil, pausedAt != nil else { return }
         pausedAt = nil
         player.play()
     }
@@ -89,12 +106,38 @@ private final class AudioDeck {
         fader.outputVolume = 1
         timePitch.rate = 1
         trim.globalGain = 0
+        setHighPass(0)
     }
 
     func unload() {
         stop()
         file = nil
         url = nil
+    }
+}
+
+/// Playback time lives in its own object so only the views that show it
+/// (scrubber, times, lyrics) redraw as it advances.
+@MainActor
+final class PlaybackClock: ObservableObject {
+    @Published fileprivate(set) var elapsed: Double = 0
+    @Published fileprivate(set) var duration: Double = 0
+    fileprivate(set) var updatedAt = Date()
+    fileprivate(set) var running = false
+
+    var progress: Double { duration > 0 ? min(max(elapsed / duration, 0), 1) : 0 }
+
+    /// Smooth position between 50 ms updates, for 120 Hz drawing.
+    func elapsed(at date: Date) -> Double {
+        guard running else { return elapsed }
+        return min(duration, elapsed + date.timeIntervalSince(updatedAt))
+    }
+
+    fileprivate func set(elapsed: Double, duration: Double, running: Bool) {
+        if abs(self.elapsed - elapsed) > 0.001 { self.elapsed = elapsed }
+        if self.duration != duration { self.duration = duration }
+        self.running = running
+        updatedAt = Date()
     }
 }
 
@@ -110,8 +153,9 @@ enum RepeatMode: String, CaseIterable {
 final class MusicPlayer: ObservableObject {
     @Published private(set) var current: Track?
     @Published private(set) var isPlaying = false
-    @Published private(set) var elapsed: Double = 0
-    @Published private(set) var duration: Double = 0
+    let clock = PlaybackClock()
+    var elapsed: Double { clock.elapsed }
+    var duration: Double { clock.duration }
     @Published private(set) var queue: [Track] = []
     @Published private(set) var index = 0
     @Published private(set) var artwork: UIImage?
@@ -149,7 +193,7 @@ final class MusicPlayer: ObservableObject {
     private var deck: AudioDeck { decks[active] }
     private var otherDeck: AudioDeck { decks[1 - active] }
 
-    var progress: Double { duration > 0 ? min(max(elapsed / duration, 0), 1) : 0 }
+    var progress: Double { clock.progress }
     var hasNext: Bool { index + 1 < queue.count || repeatMode == .all }
     var upcoming: Track? { index + 1 < queue.count ? queue[index + 1] : nil }
     var isLossless: Bool {
@@ -312,7 +356,7 @@ final class MusicPlayer: ObservableObject {
             deck.play(from: target) { [weak self] in self?.trackEnded() }
             if userPaused { deck.pause() }
         }
-        elapsed = target
+        clock.set(elapsed: target, duration: duration, running: isPlaying)
         updateNowPlaying()
     }
 
@@ -326,8 +370,7 @@ final class MusicPlayer: ObservableObject {
         currentMeta = nil
         artwork = nil
         isPlaying = false
-        elapsed = 0
-        duration = 0
+        clock.set(elapsed: 0, duration: 0, running: false)
         nextPlan = nil
         updateNowPlaying()
     }
@@ -368,8 +411,7 @@ final class MusicPlayer: ObservableObject {
     private func setCurrent(_ track: Track) {
         current = track
         currentMeta = metaProvider?(track)
-        duration = vlc == nil ? deck.duration : 0
-        elapsed = vlc == nil ? deck.currentTime : 0
+        clock.set(elapsed: vlc == nil ? deck.currentTime : 0, duration: vlc == nil ? deck.duration : 0, running: true)
         isPlaying = true
         artwork = nil
         loadArtwork(for: track)
@@ -411,7 +453,7 @@ final class MusicPlayer: ObservableObject {
             decks.forEach { $0.unload() }
             isPlaying = false
             userPaused = true
-            elapsed = 0
+            clock.set(elapsed: 0, duration: duration, running: false)
             updateNowPlaying()
         }
     }
@@ -466,12 +508,27 @@ final class MusicPlayer: ObservableObject {
         let gains = plan.curve.gains(t)
         deck.fader.outputVolume = gains.out
         otherDeck.fader.outputVolume = gains.in
+        switch plan.style {
+        case .crossfade:
+            break
+        case .bassSwap:
+            // Like a DJ: the incoming song plays without bass, then the
+            // basslines swap at the midpoint over about half a second.
+            let swap = min(1, max(0, (t - 0.5) / max(0.05, 0.5 / max(plan.length, 1))))
+            otherDeck.setHighPass(Float(350 - 330 * swap))
+            deck.setHighPass(Float(20 + 330 * swap))
+        case .filterSweep:
+            // The outgoing song is filtered away from the bottom up.
+            deck.setHighPass(Float(20 * pow(60, t)))
+            otherDeck.setHighPass(t < 0.3 ? 250 : 0)
+        }
         guard t >= 1 else { return }
 
         // Hand over to the incoming deck.
         deck.unload()
         active = 1 - active
         deck.fader.outputVolume = 1
+        deck.setHighPass(0)
         index += 1
         isMixing = false
         mixPlan = nil
@@ -485,6 +542,7 @@ final class MusicPlayer: ObservableObject {
         guard isMixing else { return }
         otherDeck.unload()
         deck.fader.outputVolume = 1
+        deck.setHighPass(0)
         isMixing = false
         mixPlan = nil
         mixStartedAt = nil
@@ -520,10 +578,13 @@ final class MusicPlayer: ObservableObject {
     }
 
     private func refresh() {
+        // Assign only on change: every @Published write redraws its observers.
         if let vlc {
-            elapsed = Double(max(0, vlc.time.intValue)) / 1000
-            duration = Double(max(0, vlc.media?.length.intValue ?? 0)) / 1000
-            isPlaying = vlc.isPlaying
+            let playing = vlc.isPlaying
+            if isPlaying != playing { isPlaying = playing }
+            clock.set(elapsed: Double(max(0, vlc.time.intValue)) / 1000,
+                      duration: Double(max(0, vlc.media?.length.intValue ?? 0)) / 1000,
+                      running: playing)
             if isPlaying { vlcStarted = true }
             if vlc.state == .error, let track = current {
                 self.vlc = nil
@@ -535,9 +596,9 @@ final class MusicPlayer: ObservableObject {
                 trackEnded()
             }
         } else {
-            elapsed = deck.currentTime
-            duration = deck.duration
-            isPlaying = !userPaused && deck.file != nil && deck.isActive
+            let playing = !userPaused && deck.file != nil && deck.isActive
+            if isPlaying != playing { isPlaying = playing }
+            clock.set(elapsed: deck.currentTime, duration: deck.duration, running: playing)
         }
     }
 
@@ -549,6 +610,16 @@ final class MusicPlayer: ObservableObject {
     }
 
     // MARK: Now Playing
+
+    /// Picks up details read after the song started (tags, catalog).
+    func refreshMeta() {
+        guard let current else { return }
+        let meta = metaProvider?(current)
+        if meta != currentMeta {
+            currentMeta = meta
+            updateNowPlaying()
+        }
+    }
 
     var title: String { currentMeta?.title ?? current?.title ?? "Not Playing" }
 

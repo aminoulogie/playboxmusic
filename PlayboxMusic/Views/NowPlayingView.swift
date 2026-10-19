@@ -2,18 +2,19 @@ import AVKit
 import MediaPlayer
 import SwiftUI
 
-/// Black page with a large rounded cover, title centered below, synced
-/// lyrics, transport, volume and quick access to mix, EQ and the queue.
+/// Black page with a large rounded cover, title with artist and album
+/// below, transport, volume and quick access to lyrics, mix, EQ and queue.
+/// Fast-changing parts (time, lyrics, cover drag) are separate views so
+/// only they redraw, keeping scrolling and gestures at 120 Hz.
 struct NowPlayingView: View {
     @EnvironmentObject private var player: MusicPlayer
     @EnvironmentObject private var library: MusicLibrary
     @EnvironmentObject private var client: SoulseekClient
     @Environment(\.dismiss) private var dismiss
-    @State private var scrub: Double?
     @State private var sheet: Sheet?
-    @State private var dragOffset: CGFloat = 0
-    @State private var heartBurst = false
+    @State private var showLyrics = false
     @State private var lyrics: [LyricLine] = []
+    @State private var lyricsLoading = false
 
     enum Sheet: String, Identifiable {
         case queue, mix, equalizer, album
@@ -28,15 +29,25 @@ struct NowPlayingView: View {
             VStack(spacing: 0) {
                 topBar
                 Spacer(minLength: 24)
-                cover(side: side)
+                ZStack {
+                    if showLyrics {
+                        LyricsPanel(lyrics: lyrics, loading: lyricsLoading, clock: player.clock) { time in
+                            if player.duration > 0 { player.seek(to: time / player.duration) }
+                        }
+                        .frame(width: proxy.size.width - 48, height: side)
+                        .transition(.opacity)
+                    } else {
+                        CoverView(side: side, coverMenu: { coverMenu }, onLike: like)
+                            .transition(.opacity)
+                    }
+                }
+                .frame(height: side)
                 Spacer(minLength: 20)
                 titleRow
-                lyricsLines
-                    .frame(height: lyrics.isEmpty ? 8 : 66)
-                scrubber
-                    .padding(.top, 10)
-                transport
+                TimeBar(clock: player.clock) { player.seek(to: $0) }
                     .padding(.top, 14)
+                transport
+                    .padding(.top, 12)
                 volume
                     .padding(.top, 18)
                 bottomBar
@@ -93,58 +104,6 @@ struct NowPlayingView: View {
         }
     }
 
-    private func cover(side: CGFloat) -> some View {
-        ZStack {
-            Group {
-                if let artwork = player.artwork {
-                    Image(uiImage: artwork).resizable().scaledToFill()
-                } else {
-                    Color(white: 0.12).overlay {
-                        Image(systemName: "music.note")
-                            .font(.system(size: side * 0.3, weight: .light))
-                            .foregroundStyle(.white.opacity(0.25))
-                    }
-                }
-            }
-            .frame(width: side, height: side)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .shadow(color: .black.opacity(0.6), radius: 20, y: 10)
-
-            Image(systemName: "heart.fill")
-                .font(.system(size: 90))
-                .foregroundStyle(.white)
-                .shadow(radius: 10)
-                .scaleEffect(heartBurst ? 1 : 0.4)
-                .opacity(heartBurst ? 0.95 : 0)
-                .allowsHitTesting(false)
-        }
-        // Shrinks slightly while paused, like Apple Music.
-        .scaleEffect(player.isPlaying ? 1 : 0.86)
-        .animation(.spring(response: 0.45, dampingFraction: 0.7), value: player.isPlaying)
-        .offset(x: dragOffset)
-        .contentShape(Rectangle())
-        .onTapGesture(count: 2) { like() }
-        .gesture(
-            DragGesture(minimumDistance: 20)
-                .onChanged { value in
-                    guard abs(value.translation.width) > abs(value.translation.height) else { return }
-                    dragOffset = value.translation.width
-                }
-                .onEnded { value in
-                    let width = value.translation.width
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) { dragOffset = 0 }
-                    if width < -80 { player.next() } else if width > 80 { player.previous() }
-                }
-        )
-        .contextMenu { coverMenu }
-        .accessibilityElement()
-        .accessibilityLabel("Album artwork")
-        .accessibilityHint("Swipe left or right to change track. Double-tap to like.")
-        .accessibilityAction(named: "Next track") { player.next() }
-        .accessibilityAction(named: "Previous track") { player.previous() }
-        .accessibilityAction(named: isFavourite ? "Remove from Favourites" : "Add to Favourites") { toggleFavourite() }
-    }
-
     @ViewBuilder
     private var coverMenu: some View {
         Button { sheet = .album } label: { Label("Go to Album", systemImage: "square.stack") }
@@ -170,6 +129,7 @@ struct NowPlayingView: View {
             }
             .accessibilityLabel(isFavourite ? "Remove from Favourites" : "Add to Favourites")
 
+            // Title, then artist and album underneath, like Apple Music.
             VStack(spacing: 3) {
                 Text(player.title)
                     .font(.title3.weight(.bold))
@@ -196,55 +156,6 @@ struct NowPlayingView: View {
         }
     }
 
-    @ViewBuilder
-    private var lyricsLines: some View {
-        if !lyrics.isEmpty {
-            let currentIndex = lyrics.lastIndex { ($0.time ?? .infinity) <= player.elapsed + 0.25 }
-            let window: [LyricLine] = {
-                guard lyrics.first?.time != nil else { return Array(lyrics.prefix(3)) }
-                let center = currentIndex ?? -1
-                return (center - 1...center + 1).compactMap { lyrics[safe: $0] }
-            }()
-            VStack(spacing: 4) {
-                ForEach(window) { line in
-                    Text(line.text)
-                        .font(line.id == currentIndex ? .callout.weight(.semibold) : .footnote)
-                        .foregroundStyle(.white.opacity(line.id == currentIndex ? 1 : 0.35))
-                        .lineLimit(1)
-                        .onTapGesture {
-                            if let time = line.time, player.duration > 0 { player.seek(to: time / player.duration) }
-                        }
-                }
-            }
-            .frame(maxWidth: .infinity)
-            .animation(.easeInOut(duration: 0.25), value: currentIndex)
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel("Lyrics")
-        }
-    }
-
-    private var scrubber: some View {
-        VStack(spacing: 6) {
-            Scrubber(
-                progress: scrub ?? player.progress,
-                enabled: player.duration > 0,
-                onChange: { scrub = $0 },
-                onCommit: {
-                    if let scrub { player.seek(to: scrub) }
-                    scrub = nil
-                }
-            )
-            HStack {
-                Text(format(position))
-                Spacer()
-                Text("-" + format(max(0, player.duration - position)))
-            }
-            .font(.caption2.weight(.medium))
-            .monospacedDigit()
-            .foregroundStyle(.white.opacity(0.5))
-        }
-    }
-
     private var transport: some View {
         HStack {
             Button { player.toggleShuffle() } label: {
@@ -256,17 +167,20 @@ struct NowPlayingView: View {
             .accessibilityLabel(player.shuffle ? "Shuffle on" : "Shuffle off")
             Spacer()
             Button { player.previous() } label: { Image(systemName: "backward.fill").font(.title) }
+                .buttonStyle(PressScaleStyle())
                 .accessibilityLabel("Previous track")
             Spacer()
             Button { player.togglePlayback() } label: {
                 Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
                     .font(.system(size: 50))
                     .frame(width: 70, height: 70)
-                    .contentTransition(.symbolEffect(.replace))
+                    .contentTransition(.symbolEffect(.replace.downUp))
             }
+            .buttonStyle(PressScaleStyle())
             .accessibilityLabel(player.isPlaying ? "Pause" : "Play")
             Spacer()
             Button { player.next() } label: { Image(systemName: "forward.fill").font(.title) }
+                .buttonStyle(PressScaleStyle())
                 .accessibilityLabel("Next track")
             Spacer()
             Button { player.cycleRepeat() } label: {
@@ -291,6 +205,15 @@ struct NowPlayingView: View {
 
     private var bottomBar: some View {
         HStack {
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { showLyrics.toggle() }
+            } label: {
+                Image(systemName: showLyrics ? "quote.bubble.fill" : "quote.bubble")
+                    .foregroundStyle(showLyrics ? Color.accentColor : .white.opacity(0.7))
+                    .frame(width: 44, height: 44)
+            }
+            .accessibilityLabel(showLyrics ? "Hide lyrics" : "Show lyrics")
+            Spacer()
             RoutePicker().frame(width: 44, height: 44)
             Spacer()
             Button { sheet = .equalizer } label: {
@@ -334,16 +257,9 @@ struct NowPlayingView: View {
 
     // MARK: Actions
 
-    private var position: Double { (scrub ?? player.progress) * player.duration }
-
     private func like() {
         guard let track = player.current else { return }
         library.setFavourite(track, true)
-        withAnimation(.spring(response: 0.3, dampingFraction: 0.5)) { heartBurst = true }
-        Task {
-            try? await Task.sleep(for: .milliseconds(650))
-            withAnimation(.easeOut(duration: 0.25)) { heartBurst = false }
-        }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     }
 
@@ -356,18 +272,179 @@ struct NowPlayingView: View {
     private func loadLyrics() async {
         lyrics = []
         guard player.current != nil else { return }
+        lyricsLoading = true
+        defer { lyricsLoading = false }
         let meta = player.currentMeta
         let title = meta?.title ?? MusicText.clean(player.title)
-        let artist = meta?.artist ?? MusicText.clean(player.current?.folder ?? "")
         lyrics = await LyricsService.shared.lyrics(
-            title: title, artist: artist.isEmpty ? nil : artist, album: meta?.album,
+            title: title, artist: meta?.artist, album: meta?.album,
             duration: player.duration > 0 ? player.duration : nil
         )
     }
+}
 
-    private func format(_ seconds: Double) -> String {
+/// The cover keeps a fixed size; it slides with your finger to change
+/// tracks, double-tap likes, long-press opens the menu.
+private struct CoverView<MenuContent: View>: View {
+    @EnvironmentObject private var player: MusicPlayer
+    let side: CGFloat
+    @ViewBuilder let coverMenu: () -> MenuContent
+    let onLike: () -> Void
+    @State private var dragOffset: CGFloat = 0
+    @State private var heartBurst = false
+
+    var body: some View {
+        ZStack {
+            Group {
+                if let artwork = player.artwork {
+                    Image(uiImage: artwork).resizable().scaledToFill()
+                } else {
+                    Color(white: 0.12).overlay {
+                        Image(systemName: "music.note")
+                            .font(.system(size: side * 0.3, weight: .light))
+                            .foregroundStyle(.white.opacity(0.25))
+                    }
+                }
+            }
+            .frame(width: side, height: side)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .shadow(color: .black.opacity(0.6), radius: 20, y: 10)
+
+            Image(systemName: "heart.fill")
+                .font(.system(size: 90))
+                .foregroundStyle(.white)
+                .shadow(radius: 10)
+                .scaleEffect(heartBurst ? 1 : 0.4)
+                .opacity(heartBurst ? 0.95 : 0)
+                .allowsHitTesting(false)
+        }
+        .offset(x: dragOffset)
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) {
+            onLike()
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.5)) { heartBurst = true }
+            Task {
+                try? await Task.sleep(for: .milliseconds(650))
+                withAnimation(.easeOut(duration: 0.25)) { heartBurst = false }
+            }
+        }
+        .gesture(
+            DragGesture(minimumDistance: 15)
+                .onChanged { value in
+                    guard abs(value.translation.width) > abs(value.translation.height) else { return }
+                    dragOffset = value.translation.width
+                }
+                .onEnded { value in
+                    let width = value.translation.width
+                    let velocity = value.predictedEndTranslation.width
+                    withAnimation(.interactiveSpring(response: 0.3, dampingFraction: 0.85)) { dragOffset = 0 }
+                    if width < -80 || velocity < -300 { player.next() }
+                    else if width > 80 || velocity > 300 { player.previous() }
+                }
+        )
+        .contextMenu { coverMenu() }
+        .accessibilityElement()
+        .accessibilityLabel("Album artwork")
+        .accessibilityHint("Swipe left or right to change track. Double-tap to like.")
+        .accessibilityAction(named: "Next track") { player.next() }
+        .accessibilityAction(named: "Previous track") { player.previous() }
+    }
+}
+
+/// Synced lyrics in place of the cover, following the song.
+private struct LyricsPanel: View {
+    let lyrics: [LyricLine]
+    let loading: Bool
+    @ObservedObject var clock: PlaybackClock
+    let onSeek: (Double) -> Void
+
+    private var currentIndex: Int? {
+        lyrics.lastIndex { ($0.time ?? .infinity) <= clock.elapsed + 0.25 }
+    }
+
+    var body: some View {
+        if lyrics.isEmpty {
+            VStack(spacing: 10) {
+                if loading { ProgressView() } else {
+                    Image(systemName: "quote.bubble").font(.largeTitle).foregroundStyle(.white.opacity(0.3))
+                    Text("No lyrics found for this song").foregroundStyle(.white.opacity(0.5))
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollViewReader { reader in
+                ScrollView(showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        ForEach(lyrics) { line in
+                            Text(line.text)
+                                .font(.title2.weight(.bold))
+                                .foregroundStyle(.white.opacity(line.id == currentIndex ? 1 : 0.3))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .id(line.id)
+                                .onTapGesture { if let time = line.time { onSeek(time) } }
+                        }
+                    }
+                    .padding(.vertical, 40)
+                }
+                .mask(LinearGradient(stops: [
+                    .init(color: .clear, location: 0), .init(color: .black, location: 0.12),
+                    .init(color: .black, location: 0.88), .init(color: .clear, location: 1)
+                ], startPoint: .top, endPoint: .bottom))
+                .onChange(of: currentIndex) { _, index in
+                    guard let index else { return }
+                    withAnimation(.easeInOut(duration: 0.35)) { reader.scrollTo(index, anchor: .center) }
+                }
+            }
+        }
+    }
+}
+
+/// Scrubber and times. Draws every frame (120 Hz on ProMotion) from the
+/// playback clock without redrawing the rest of the page.
+private struct TimeBar: View {
+    @ObservedObject var clock: PlaybackClock
+    let onSeek: (Double) -> Void
+    @State private var scrub: Double?
+
+    var body: some View {
+        TimelineView(.animation(paused: !clock.running || scrub != nil)) { context in
+            let elapsed = clock.elapsed(at: context.date)
+            let progress = scrub ?? (clock.duration > 0 ? elapsed / clock.duration : 0)
+            let position = progress * clock.duration
+            VStack(spacing: 6) {
+                Scrubber(
+                    progress: progress,
+                    enabled: clock.duration > 0,
+                    onChange: { scrub = $0 },
+                    onCommit: {
+                        if let scrub { onSeek(scrub) }
+                        scrub = nil
+                    }
+                )
+                HStack {
+                    Text(Self.format(position))
+                    Spacer()
+                    Text("-" + Self.format(max(0, clock.duration - position)))
+                }
+                .font(.caption2.weight(.medium))
+                .monospacedDigit()
+                .foregroundStyle(.white.opacity(0.5))
+            }
+        }
+    }
+
+    static func format(_ seconds: Double) -> String {
         let total = max(0, Int(seconds.isFinite ? seconds : 0))
         return String(format: "%d:%02d", total / 60, total % 60)
+    }
+}
+
+/// Buttons shrink slightly while pressed.
+struct PressScaleStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.88 : 1)
+            .animation(.spring(response: 0.2, dampingFraction: 0.7), value: configuration.isPressed)
     }
 }
 
