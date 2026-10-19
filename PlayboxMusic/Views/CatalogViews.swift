@@ -1,13 +1,166 @@
+import AVFoundation
+import Combine
 import SwiftUI
 
-/// iTunes-catalog results: albums as covers, songs as rows with GET buttons.
+/// Plays Apple's free 30-second previews.
+@MainActor
+final class PreviewPlayer: ObservableObject {
+    static let shared = PreviewPlayer()
+    @Published private(set) var playingID: Int?
+    private let player = AVPlayer()
+    private var endObserver: NSObjectProtocol?
+
+    func toggle(_ item: ITunesItem) {
+        if playingID == item.id {
+            stop()
+            return
+        }
+        guard let string = item.previewUrl, let url = URL(string: string) else { return }
+        try? AVAudioSession.sharedInstance().setActive(true)
+        player.replaceCurrentItem(with: AVPlayerItem(url: url))
+        player.play()
+        playingID = item.id
+        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime, object: player.currentItem, queue: .main
+        ) { [weak self] _ in Task { @MainActor in self?.stop() } }
+    }
+
+    func stop() {
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        playingID = nil
+    }
+}
+
+/// Catalog home: recent searches, charts, new releases and genres.
+struct CatalogHomeView: View {
+    let recentSearches: [String]
+    let onSearch: (String) -> Void
+    @State private var topSongs: [ITunesItem] = []
+    @State private var topAlbums: [ITunesItem] = []
+    @State private var newReleases: [ITunesItem] = []
+
+    var body: some View {
+        if !recentSearches.isEmpty {
+            Section("Recent Searches") {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(recentSearches, id: \.self) { term in
+                            Button(term) { onSearch(term) }
+                                .font(.subheadline)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 7)
+                                .background(Color(white: 0.15), in: Capsule())
+                                .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                }
+                .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
+            }
+        }
+
+        AlbumCarousel(title: "Top Albums", albums: topAlbums)
+        AlbumCarousel(title: "New Releases", albums: newReleases)
+
+        if !topSongs.isEmpty {
+            Section("Top Songs") {
+                ForEach(Array(topSongs.prefix(15).enumerated()), id: \.element.id) { rank, song in
+                    SongRow(song: song, leading: "\(rank + 1)")
+                }
+            }
+        }
+
+        Section("Genres") {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], spacing: 10) {
+                ForEach(ITunesCatalog.genres.indices, id: \.self) { index in
+                    let genre = ITunesCatalog.genres[index]
+                    NavigationLink(value: GenreRoute(id: genre.id, name: genre.name)) {
+                        HStack {
+                            Image(systemName: genre.symbol)
+                            Text(genre.name).font(.subheadline.weight(.semibold)).lineLimit(1)
+                            Spacer(minLength: 0)
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity)
+                        .background(Color(white: 0.13), in: RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+        }
+        .task {
+            guard topSongs.isEmpty else { return }
+            async let songs = try? ITunesCatalog.chart("topsongs", limit: 30)
+            async let albums = try? ITunesCatalog.chart("topalbums", limit: 30)
+            async let releases = try? ITunesCatalog.newReleases()
+            let (s, a, r) = await (songs, albums, releases)
+            topSongs = s ?? []
+            topAlbums = a ?? []
+            newReleases = Array((r ?? []).prefix(20))
+        }
+    }
+}
+
+struct GenreRoute: Hashable {
+    let id: Int
+    let name: String
+}
+
+struct GenreView: View {
+    let route: GenreRoute
+    @State private var albums: [ITunesItem] = []
+    @State private var songs: [ITunesItem] = []
+    @State private var loading = true
+
+    var body: some View {
+        List {
+            AlbumCarousel(title: "Top Albums", albums: albums)
+            if !songs.isEmpty {
+                Section("Top Songs") {
+                    ForEach(Array(songs.enumerated()), id: \.element.id) { rank, song in
+                        SongRow(song: song, leading: "\(rank + 1)")
+                    }
+                }
+            }
+        }
+        .overlay { if loading { ProgressView() } }
+        .navigationTitle(route.name)
+        .task {
+            async let a = try? ITunesCatalog.chart("topalbums", genre: route.id, limit: 25)
+            async let s = try? ITunesCatalog.chart("topsongs", genre: route.id, limit: 40)
+            let (albumResults, songResults) = await (a, s)
+            albums = albumResults ?? []
+            songs = songResults ?? []
+            loading = false
+        }
+    }
+}
+
+/// iTunes-catalog search results: albums as covers, songs as rows.
 struct CatalogResultsView: View {
     let albums: [ITunesItem]
     let songs: [ITunesItem]
 
     var body: some View {
+        AlbumCarousel(title: "Albums", albums: albums)
+        if !songs.isEmpty {
+            Section("Songs") {
+                ForEach(songs) { song in SongRow(song: song) }
+            }
+        }
+    }
+}
+
+struct AlbumCarousel: View {
+    let title: String
+    let albums: [ITunesItem]
+
+    var body: some View {
         if !albums.isEmpty {
-            Section {
+            Section(title) {
                 ScrollView(.horizontal, showsIndicators: false) {
                     LazyHStack(alignment: .top, spacing: 14) {
                         ForEach(albums) { album in
@@ -27,100 +180,182 @@ struct CatalogResultsView: View {
                     .padding(.horizontal, 16)
                 }
                 .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
-            } header: {
-                Text("Albums")
             }
         }
+    }
+}
 
-        if !songs.isEmpty {
-            Section("Songs") {
-                ForEach(songs) { song in
-                    HStack(spacing: 12) {
-                        CatalogArtwork(url: song.artworkURL(size: 200), size: 48)
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 4) {
-                                Text(song.trackName ?? "").font(.subheadline.weight(.semibold)).lineLimit(1)
-                                if song.isExplicit { ExplicitBadge() }
-                            }
-                            Text([song.artistName, song.collectionName].compactMap { $0 }.joined(separator: " · "))
-                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+/// A song with cover, preview on tap, downloaded mark and GET button.
+struct SongRow: View {
+    @EnvironmentObject private var library: MusicLibrary
+    @ObservedObject private var preview = PreviewPlayer.shared
+    let song: ITunesItem
+    var leading: String?
+    var showsArtwork = true
+
+    var body: some View {
+        HStack(spacing: 12) {
+            if let leading {
+                Text(leading)
+                    .font(.subheadline).monospacedDigit().foregroundStyle(.secondary)
+                    .frame(width: 26, alignment: .leading)
+            }
+            if showsArtwork {
+                CatalogArtwork(url: song.artworkURL(size: 200), size: 48)
+                    .overlay {
+                        if preview.playingID == song.id {
+                            Image(systemName: "waveform")
+                                .symbolEffect(.variableColor.iterative)
+                                .foregroundStyle(.white)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .background(.black.opacity(0.5))
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
                         }
-                        Spacer(minLength: 4)
-                        GetSongButton(song: song)
+                    }
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    Text(song.trackName ?? "").font(.subheadline.weight(.semibold)).lineLimit(1)
+                    if song.isExplicit { ExplicitBadge() }
+                    if library.has(title: song.trackName, artist: song.artistName) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.caption).foregroundStyle(.green)
+                            .accessibilityLabel("Downloaded")
                     }
                 }
+                Text([song.artistName, showsArtwork ? song.collectionName : song.durationText]
+                    .compactMap { $0 }.joined(separator: " · "))
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
+            Spacer(minLength: 4)
+            GetSongButton(song: song)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { PreviewPlayer.shared.toggle(song) }
+        .accessibilityAction(named: preview.playingID == song.id ? "Stop preview" : "Play preview") {
+            PreviewPlayer.shared.toggle(song)
         }
     }
 }
 
 /// Album page modelled on the iTunes Store layout.
 struct AlbumDetailView: View {
-    @EnvironmentObject private var client: SoulseekClient
+    @EnvironmentObject private var library: MusicLibrary
     let album: ITunesItem
     @State private var tracks: [ITunesItem] = []
+    @State private var moreByArtist: [ITunesItem] = []
     @State private var loading = true
 
     var body: some View {
         List {
             Section {
-                HStack(alignment: .top, spacing: 14) {
-                    CatalogArtwork(url: album.artworkURL(size: 600), size: 130)
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 4) {
-                            Text(album.collectionName ?? "").font(.headline).lineLimit(3)
-                            if album.isExplicit { ExplicitBadge() }
-                        }
-                        Text(album.artistName ?? "").font(.subheadline).foregroundStyle(.tint).lineLimit(1)
-                        Spacer(minLength: 6)
-                        Group {
-                            if let genre = album.primaryGenreName { Text(genre) }
-                            if let count = album.trackCount { Text("\(count) Songs") }
-                            if let released = album.releaseText { Text(released) }
-                        }
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        GetAlbumButton(album: album)
-                            .padding(.top, 4)
-                    }
-                }
-                .padding(.vertical, 4)
+                header
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Color.clear)
             }
 
             Section("Songs") {
-                if loading {
-                    ProgressView().frame(maxWidth: .infinity)
-                }
+                if loading { ProgressView().frame(maxWidth: .infinity) }
                 ForEach(tracks) { track in
-                    HStack(spacing: 12) {
-                        Text("\(track.trackNumber ?? 0)")
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                            .frame(width: 24, alignment: .leading)
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 4) {
-                                Text(track.trackName ?? "").font(.subheadline).lineLimit(1)
-                                if track.isExplicit { ExplicitBadge() }
-                            }
-                            if track.artistName != album.artistName, let artist = track.artistName {
-                                Text(artist).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                            }
-                        }
-                        Spacer(minLength: 4)
-                        if let duration = track.durationText {
-                            Text(duration).font(.caption).monospacedDigit().foregroundStyle(.secondary)
-                        }
-                        GetSongButton(song: track)
-                    }
+                    SongRow(song: track, leading: "\(track.trackNumber ?? 0)", showsArtwork: false)
                 }
             }
+
+            AlbumCarousel(title: "More by \(album.artistName ?? "Artist")", albums: moreByArtist)
         }
         .navigationTitle(album.collectionName ?? "Album")
         .navigationBarTitleDisplayMode(.inline)
+        .onDisappear { PreviewPlayer.shared.stop() }
         .task {
             guard let id = album.collectionId else { return }
-            tracks = (try? await ITunesCatalog.albumTracks(id)) ?? []
+            async let songs = try? ITunesCatalog.albumTracks(id)
+            async let more = otherAlbums()
+            let (songResults, moreResults) = await (songs, more)
+            tracks = songResults ?? []
+            moreByArtist = (moreResults ?? []).filter { $0.collectionId != album.collectionId }.prefix(15).map { $0 }
+            loading = false
+        }
+    }
+
+    private func otherAlbums() async -> [ITunesItem]? {
+        guard let artistId = album.artistId else { return nil }
+        return try? await ITunesCatalog.artistAlbums(artistId)
+    }
+
+    private var header: some View {
+        ZStack {
+            // Blurred cover behind the header, fading into the page.
+            CatalogArtwork(url: album.artworkURL(size: 300), size: 420)
+                .blur(radius: 50)
+                .opacity(0.45)
+                .frame(maxWidth: .infinity)
+                .frame(height: 260)
+                .clipped()
+                .overlay(LinearGradient(colors: [.clear, .black], startPoint: .center, endPoint: .bottom))
+
+            HStack(alignment: .top, spacing: 16) {
+                CatalogArtwork(url: album.artworkURL(size: 600), size: 150)
+                    .shadow(color: .black.opacity(0.5), radius: 12, y: 6)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Text(album.collectionName ?? "").font(.title3.bold()).lineLimit(3)
+                        if album.isExplicit { ExplicitBadge() }
+                    }
+                    if let artistId = album.artistId, let name = album.artistName {
+                        NavigationLink(value: ITunesItem.artist(id: artistId, name: name)) {
+                            HStack(spacing: 2) {
+                                Text(name).lineLimit(1)
+                                Image(systemName: "chevron.right").font(.caption2)
+                            }
+                            .font(.subheadline)
+                            .foregroundStyle(.tint)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    Spacer(minLength: 4)
+                    Group {
+                        if let genre = album.primaryGenreName { Text(genre) }
+                        if let count = album.trackCount { Text("\(count) Songs") }
+                        if let released = album.releaseText { Text(released) }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    GetAlbumButton(album: album).padding(.top, 6)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(16)
+        }
+    }
+}
+
+/// Artist page: top songs, albums and singles.
+struct ArtistView: View {
+    let artist: ITunesItem
+    @State private var songs: [ITunesItem] = []
+    @State private var albums: [ITunesItem] = []
+    @State private var loading = true
+
+    var body: some View {
+        List {
+            if !songs.isEmpty {
+                Section("Top Songs") {
+                    ForEach(songs.prefix(10)) { song in SongRow(song: song) }
+                }
+            }
+            AlbumCarousel(title: "Albums", albums: albums.filter { !$0.isSingle })
+            AlbumCarousel(title: "Singles & EPs", albums: albums.filter(\.isSingle))
+        }
+        .overlay { if loading { ProgressView() } }
+        .navigationTitle(artist.artistName ?? "Artist")
+        .onDisappear { PreviewPlayer.shared.stop() }
+        .task {
+            guard let id = artist.artistId else { return }
+            async let s = try? ITunesCatalog.artistSongs(id)
+            async let a = try? ITunesCatalog.artistAlbums(id)
+            let (songResults, albumResults) = await (s, a)
+            songs = songResults ?? []
+            albums = albumResults ?? []
             loading = false
         }
     }
@@ -139,6 +374,7 @@ private struct GetSongButton: View {
     var body: some View {
         FetchButton(state: client.fetches[key], transfers: client.transfers, label: "GET") {
             guard client.isConnected else { return }
+            PreviewPlayer.shared.stop()
             Task {
                 await client.fetchSong(
                     key: key,
@@ -280,7 +516,7 @@ struct CatalogArtwork: View {
             }
         }
         .frame(width: size, height: size)
-        .clipShape(RoundedRectangle(cornerRadius: size * 0.07))
+        .clipShape(RoundedRectangle(cornerRadius: size * 0.05))
     }
 }
 

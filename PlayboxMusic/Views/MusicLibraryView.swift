@@ -16,6 +16,26 @@ struct MusicLibraryView: View {
 
     var body: some View {
         List {
+            if filter.isEmpty, !library.favouriteTracks.isEmpty {
+                Section("Favourites") {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        LazyHStack(spacing: 12) {
+                            ForEach(Array(library.favouriteTracks.enumerated()), id: \.element.id) { offset, track in
+                                Button { player.play(library.favouriteTracks, startAt: offset) } label: {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        ArtworkThumbnail(track: track, size: 110)
+                                        Text(library.title(of: track)).font(.caption.weight(.semibold)).lineLimit(1)
+                                    }
+                                    .frame(width: 110)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                    }
+                    .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
+                }
+            }
             ForEach(Array(visible.enumerated()), id: \.element.id) { offset, track in
                 Button { player.play(visible, startAt: offset) } label: {
                     HStack(spacing: 12) {
@@ -35,6 +55,16 @@ struct MusicLibraryView: View {
                 .buttonStyle(.plain)
                 .swipeActions {
                     Button("Delete", role: .destructive) { library.delete(track) }
+                }
+                .swipeActions(edge: .leading) {
+                    Button {
+                        library.setFavourite(track, !library.isFavourite(track))
+                    } label: {
+                        Label("Like", systemImage: library.isFavourite(track) ? "heart.slash" : "heart")
+                    }
+                    .tint(.pink)
+                    Button { player.playNext(track) } label: { Label("Play Next", systemImage: "text.insert") }
+                        .tint(.indigo)
                 }
             }
         }

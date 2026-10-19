@@ -9,6 +9,16 @@ struct MusicSearchView: View {
     @State private var albums: [ITunesItem] = []
     @State private var songs: [ITunesItem] = []
     @State private var catalogLoading = false
+    @AppStorage("music.recentSearches") private var recentStore = ""
+
+    private var recentSearches: [String] {
+        recentStore.split(separator: "\n").map(String.init)
+    }
+
+    private func remember(_ term: String) {
+        let list = [term] + recentSearches.filter { $0.caseInsensitiveCompare(term) != .orderedSame }
+        recentStore = list.prefix(10).joined(separator: "\n")
+    }
 
     enum Mode: String, CaseIterable, Identifiable {
         case catalog = "Catalog"
@@ -64,7 +74,11 @@ struct MusicSearchView: View {
             }
 
             if mode == .catalog {
-                CatalogResultsView(albums: albums, songs: songs)
+                if query.trimmingCharacters(in: .whitespaces).count < 2 {
+                    CatalogHomeView(recentSearches: recentSearches) { term in query = term }
+                } else {
+                    CatalogResultsView(albums: albums, songs: songs)
+                }
             } else if !client.results.isEmpty || client.isSearching {
                 Section {
                     ForEach(visibleResults) { result in
@@ -83,14 +97,12 @@ struct MusicSearchView: View {
         }
         .overlay {
             if mode == .catalog {
-                if catalogLoading && albums.isEmpty && songs.isEmpty {
-                    ProgressView()
-                } else if albums.isEmpty && songs.isEmpty {
-                    ContentUnavailableView(
-                        "Find Music",
-                        systemImage: "music.magnifyingglass",
-                        description: Text("Search albums and songs, then tap GET to download the best copy from Soulseek.")
-                    )
+                if query.trimmingCharacters(in: .whitespaces).count >= 2 {
+                    if catalogLoading && albums.isEmpty && songs.isEmpty {
+                        ProgressView()
+                    } else if !catalogLoading && albums.isEmpty && songs.isEmpty {
+                        ContentUnavailableView.search(text: query)
+                    }
                 }
             } else if client.isConnected && client.results.isEmpty && !client.isSearching {
                 ContentUnavailableView(
@@ -105,7 +117,7 @@ struct MusicSearchView: View {
         .autocorrectionDisabled()
         .textInputAutocapitalization(.never)
         .onSubmit(of: .search) {
-            if mode == .soulseek { Task { await client.search(query) } }
+            if mode == .soulseek { Task { await client.search(query) } } else { remember(query) }
         }
         // The catalog is fast, so it searches as you type.
         .task(id: mode == .catalog ? query : "") {
@@ -125,8 +137,15 @@ struct MusicSearchView: View {
             guard !Task.isCancelled else { return }
             albums = newAlbums
             songs = newSongs
+            catalogLoading = false
+            // Remember searches the user settled on.
+            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            if !newAlbums.isEmpty || !newSongs.isEmpty { remember(term) }
         }
-        .navigationDestination(for: ITunesItem.self) { AlbumDetailView(album: $0) }
+        .navigationDestination(for: ITunesItem.self) { item in
+            if item.wrapperType == "artist" { ArtistView(artist: item) } else { AlbumDetailView(album: item) }
+        }
+        .navigationDestination(for: GenreRoute.self) { GenreView(route: $0) }
         .toolbar {
             Menu {
                 Toggle("Audio files only", isOn: $audioOnly)

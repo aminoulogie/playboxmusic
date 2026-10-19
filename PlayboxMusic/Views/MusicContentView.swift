@@ -28,6 +28,7 @@ struct MusicContentView: View {
         .preferredColorScheme(.dark)
         .task {
             player.metaProvider = { [library] track in library.meta(for: track) }
+            player.similarProvider = { [library] track, played in library.similar(to: track, excluding: played) }
             client.onDownloadFinished = { url, play, meta in
                 if let meta { library.setMeta(meta, for: url) }
                 library.reload()
@@ -57,64 +58,90 @@ struct MusicContentView: View {
     }
 }
 
+/// Black mini player: swipe for next/previous, heart, progress line.
 private struct MiniPlayerInset: ViewModifier {
     @EnvironmentObject private var player: MusicPlayer
+    @EnvironmentObject private var library: MusicLibrary
+    @EnvironmentObject private var client: SoulseekClient
     @State private var showNowPlaying = false
+    @State private var dragOffset: CGFloat = 0
 
     func body(content: Content) -> some View {
         content.safeAreaInset(edge: .bottom, spacing: 0) {
-            if player.current != nil {
-                Button { showNowPlaying = true } label: {
-                    HStack(spacing: 12) {
-                        Group {
-                            if let artwork = player.artwork {
-                                Image(uiImage: artwork).resizable().scaledToFill()
-                            } else {
-                                Image(systemName: "music.note")
-                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                                    .background(Color(white: 0.16))
-                            }
+            if let track = player.current {
+                let liked = library.isFavourite(track)
+                HStack(spacing: 12) {
+                    Group {
+                        if let artwork = player.artwork {
+                            Image(uiImage: artwork).resizable().scaledToFill()
+                        } else {
+                            Image(systemName: "music.note")
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                                .background(Color(white: 0.16))
                         }
-                        .frame(width: 42, height: 42)
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(player.title).font(.subheadline.weight(.semibold)).lineLimit(1)
-                            Text(player.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                        }
-                        Spacer(minLength: 0)
-                        Button { player.togglePlayback() } label: {
-                            Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
-                                .font(.title3)
-                                .frame(width: 44, height: 44)
-                        }
-                        .accessibilityLabel(player.isPlaying ? "Pause" : "Play")
-                        Button { player.next() } label: {
-                            Image(systemName: "forward.fill").frame(width: 44, height: 44)
-                        }
-                        .disabled(!player.hasNext)
-                        .accessibilityLabel("Next track")
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background {
-                        ZStack {
-                            Color.black
-                            // Faint tint from the cover, like the full player.
-                            if let artwork = player.artwork {
-                                Image(uiImage: artwork).resizable().scaledToFill().blur(radius: 30).opacity(0.3)
-                            }
-                        }
-                        .clipped()
+                    .frame(width: 42, height: 42)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(player.title).font(.subheadline.weight(.semibold)).lineLimit(1)
+                        Text(player.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }
-                    .overlay(alignment: .top) {
-                        GeometryReader { proxy in
-                            Rectangle().fill(.tint).frame(width: proxy.size.width * player.progress, height: 2)
-                        }
-                        .frame(height: 2)
+                    .offset(x: dragOffset)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .clipped()
+                    Button {
+                        library.setFavourite(track, !liked)
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    } label: {
+                        Image(systemName: liked ? "heart.fill" : "heart")
+                            .foregroundStyle(liked ? .pink : .white.opacity(0.8))
+                            .frame(width: 40, height: 44)
                     }
+                    .accessibilityLabel(liked ? "Remove from Favourites" : "Add to Favourites")
+                    Button { player.togglePlayback() } label: {
+                        Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
+                            .font(.title3)
+                            .frame(width: 40, height: 44)
+                    }
+                    .accessibilityLabel(player.isPlaying ? "Pause" : "Play")
+                    Button { player.next() } label: {
+                        Image(systemName: "forward.fill").frame(width: 40, height: 44)
+                    }
+                    .accessibilityLabel("Next track")
                 }
-                .buttonStyle(.plain)
-                .sheet(isPresented: $showNowPlaying) { NowPlayingView() }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Color.black)
+                .overlay(alignment: .top) {
+                    GeometryReader { proxy in
+                        Rectangle().fill(.white.opacity(0.85)).frame(width: proxy.size.width * player.progress, height: 2)
+                    }
+                    .frame(height: 2)
+                }
+                .overlay(alignment: .top) { Divider().opacity(0.4) }
+                .contentShape(Rectangle())
+                .onTapGesture { showNowPlaying = true }
+                .gesture(
+                    DragGesture(minimumDistance: 20)
+                        .onChanged { value in
+                            guard abs(value.translation.width) > abs(value.translation.height) else { return }
+                            dragOffset = value.translation.width
+                        }
+                        .onEnded { value in
+                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { dragOffset = 0 }
+                            if value.translation.width < -70 { player.next() }
+                            if value.translation.width > 70 { player.previous() }
+                            if value.translation.height < -50, abs(value.translation.width) < 40 { showNowPlaying = true }
+                        }
+                )
+                .accessibilityElement(children: .contain)
+                .accessibilityAction(named: "Open Now Playing") { showNowPlaying = true }
+                .sheet(isPresented: $showNowPlaying) {
+                    NowPlayingView()
+                        .environmentObject(player)
+                        .environmentObject(library)
+                        .environmentObject(client)
+                }
             }
         }
     }

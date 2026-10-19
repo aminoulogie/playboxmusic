@@ -25,6 +25,7 @@ struct TrackMeta: Codable, Hashable, Sendable {
 final class MusicLibrary: ObservableObject {
     @Published private(set) var tracks: [Track] = []
     @Published private(set) var metadata: [String: TrackMeta] = [:]
+    @Published private(set) var favourites: Set<String> = []
     let root: URL
 
     private var metadataURL: URL { root.appendingPathComponent(".playbox-metadata.json") }
@@ -37,7 +38,44 @@ final class MusicLibrary: ObservableObject {
            let saved = try? JSONDecoder().decode([String: TrackMeta].self, from: data) {
             metadata = saved
         }
+        favourites = Set(UserDefaults.standard.stringArray(forKey: "music.favourites") ?? [])
         reload()
+    }
+
+    var favouriteTracks: [Track] { tracks.filter(isFavourite) }
+
+    func isFavourite(_ track: Track) -> Bool { favourites.contains(key(for: track.url)) }
+
+    func setFavourite(_ track: Track, _ value: Bool) {
+        let id = key(for: track.url)
+        if value { favourites.insert(id) } else { favourites.remove(id) }
+        UserDefaults.standard.set(Array(favourites), forKey: "music.favourites")
+    }
+
+    /// Songs to autoplay after the queue: same artist, then same folder, then
+    /// favourites, then anything else not played recently.
+    func similar(to track: Track, excluding played: [Track], limit: Int = 10) -> [Track] {
+        let exclude = Set(played.suffix(50))
+        let pool = tracks.filter { !exclude.contains($0) }
+        let artist = meta(for: track)?.artist?.lowercased()
+        let sameArtist = pool.filter { artist != nil && meta(for: $0)?.artist?.lowercased() == artist }
+        let sameFolder = pool.filter { $0.url.deletingLastPathComponent() == track.url.deletingLastPathComponent() }
+        let liked = pool.filter(isFavourite)
+        var picked: [Track] = []
+        for candidate in sameArtist.shuffled() + sameFolder + liked.shuffled() + pool.shuffled()
+        where !picked.contains(candidate) {
+            picked.append(candidate)
+            if picked.count == limit { break }
+        }
+        return picked
+    }
+
+    /// Whether a catalog song is already downloaded.
+    func has(title: String?, artist: String?) -> Bool {
+        guard let title = title?.lowercased() else { return false }
+        return metadata.values.contains {
+            $0.title.lowercased() == title && (artist == nil || $0.artist?.lowercased() == artist?.lowercased())
+        }
     }
 
     func meta(for track: Track) -> TrackMeta? { metadata[key(for: track.url)] }

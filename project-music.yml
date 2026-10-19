@@ -24,6 +24,9 @@ targets:
       properties:
         CFBundleDisplayName: Playbox Music
         UIBackgroundModes: [audio]
+        # Router port mapping (UPnP) uses plain HTTP on the local network.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         NSLocalNetworkUsageDescription: Playbox Music accepts incoming Soulseek peer connections for searches and downloads.

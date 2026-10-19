@@ -2,6 +2,8 @@ import SwiftUI
 
 struct MusicAccountView: View {
     @EnvironmentObject private var client: SoulseekClient
+    @EnvironmentObject private var player: MusicPlayer
+    @State private var showEqualizer = false
     @AppStorage("playbox.music.username") private var username = ""
     @State private var password = ""
 
@@ -28,6 +30,17 @@ struct MusicAccountView: View {
                 Text("A new username is registered automatically the first time you sign in with it. Keep the password: it cannot be recovered.")
             }
 
+            Section {
+                EmptyView()
+            } header: {
+                Text("Mix between songs")
+            }
+            MixSettingsForm(mix: player.mix)
+
+            Section("Sound") {
+                Button("Equalizer") { showEqualizer = true }
+            }
+
             Section("Status") {
                 LabeledContent("Server", value: statusText)
                 if let port = client.listenPort {
@@ -42,6 +55,7 @@ struct MusicAccountView: View {
             }
         }
         .navigationTitle("Account")
+        .sheet(isPresented: $showEqualizer) { EqualizerView().environmentObject(player) }
         .onAppear {
             if password.isEmpty, !username.isEmpty {
                 password = CredentialStore.password(for: username) ?? ""

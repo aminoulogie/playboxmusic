@@ -2,6 +2,7 @@ import Combine
 import CryptoKit
 import Foundation
 import Network
+import UIKit
 
 /// A minimal Soulseek client: server login, file search, and downloads.
 ///
@@ -23,6 +24,8 @@ final class SoulseekClient: ObservableObject {
     @Published private(set) var isSearching = false
     @Published private(set) var transfers: [SlskTransfer] = []
     @Published private(set) var listenPort: UInt16?
+    /// How the router was asked to open our port, if it worked.
+    @Published private(set) var portMapping: String?
 
     /// Catalog-driven lookups ("GET" buttons), keyed by song or album.
     enum FetchState: Equatable {
@@ -52,6 +55,8 @@ final class SoulseekClient: ObservableObject {
     private var searchTimeout: Task<Void, Never>?
     private var collectors: [UInt32: [SlskSearchResult]] = [:]
     private var transferMeta: [UUID: TrackMeta] = [:]
+    private var resumeAttempts: [UUID: Int] = [:]
+    private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     private var peers: [String: SlskSocket] = [:]
     private var addressWaiters: [String: [CheckedContinuation<(String, UInt16)?, Never>]] = [:]
     private var pierceWaiters: [UInt32: CheckedContinuation<SlskSocket?, Never>] = [:]
@@ -126,9 +131,14 @@ final class SoulseekClient: ObservableObject {
             connectionState = .connected(greeting)
             serverTask = Task { [weak self] in await self?.readServer(socket) }
             keepAliveTask = Task { [weak self] in
+                var elapsed = 0
+                await self?.mapPort(port)
                 while !Task.isCancelled {
                     do { try await Task.sleep(for: .seconds(120)) } catch { return }
                     try? await self?.server?.send(SlskWriter.message(code: 32))
+                    elapsed += 120
+                    // Router mappings last an hour; renew every 30 minutes.
+                    if elapsed % 1800 == 0 { await self?.mapPort(port) }
                 }
             }
         } catch {
@@ -136,6 +146,16 @@ final class SoulseekClient: ObservableObject {
             if server === socket { server = nil }
             stopListener()
             connectionState = .failed(error.localizedDescription)
+        }
+    }
+
+    private func mapPort(_ port: UInt16) async {
+        guard port != 0 else { return }
+        let mapping = await PortMapper.map(port: port)
+        portMapping = mapping.map { "\($0.method), port \($0.externalPort)" }
+        // Peers dial the external port the router gave us.
+        if let external = mapping?.externalPort, external != port {
+            try? await server?.send(SlskWriter.message(code: 2) { $0.u32(UInt32(external)) })
         }
     }
 
@@ -155,6 +175,7 @@ final class SoulseekClient: ObservableObject {
         peers.values.forEach { $0.close() }
         peers = [:]
         stopListener()
+        portMapping = nil
         addressWaiters.values.joined().forEach { $0.resume(returning: nil) }
         addressWaiters = [:]
         pierceWaiters.values.forEach { $0.resume(returning: nil) }
@@ -216,32 +237,70 @@ final class SoulseekClient: ObservableObject {
     // MARK: Catalog fetches
 
     /// Searches Soulseek for one song and downloads the best matching file.
+    /// If a source fails, is denied or doesn't start, the next best user is
+    /// tried automatically (up to five).
     func fetchSong(key: String, artist: String?, title: String, durationSeconds: Int?, meta: TrackMeta, play: Bool) async {
         let query = MusicText.clean([artist, title].compactMap { $0 }.joined(separator: " "))
         let candidates = await collect(key: key, query: query) { results in
-            Self.bestSong(in: results, durationSeconds: durationSeconds) != nil && results.count > 30
+            !Self.rankedSongs(in: results, durationSeconds: durationSeconds).isEmpty && results.count > 30
         }
-        guard let best = Self.bestSong(in: candidates, durationSeconds: durationSeconds) else {
+        let ranked = Self.rankedSongs(in: candidates, durationSeconds: durationSeconds)
+        guard !ranked.isEmpty else {
             fetches[key] = .notFound
             return
         }
-        fetches[key] = .downloading([download(best, play: play, meta: meta)])
+        for candidate in ranked.prefix(5) {
+            let id = download(candidate, play: play, meta: meta)
+            fetches[key] = .downloading([id])
+            if await supervise([id]) { return }
+            cancelTransfer(id, reason: "Skipped: \(candidate.username) didn't send the file.")
+        }
     }
 
-    /// Finds the shared folder that best matches an album and downloads all of it.
+    /// Finds the shared folder that best matches an album and downloads all
+    /// of it, moving on to the next folder if the first user doesn't respond.
     func fetchAlbum(key: String, artist: String?, album: String, trackCount: Int?, meta: TrackMeta, play: Bool) async {
         let query = MusicText.clean([artist, album].compactMap { $0 }.joined(separator: " "))
         let candidates = await collect(key: key, query: query) { _ in false }
-        guard let files = Self.bestFolder(in: candidates, trackCount: trackCount) else {
+        let folders = Self.rankedFolders(in: candidates, trackCount: trackCount)
+        guard !folders.isEmpty else {
             fetches[key] = .notFound
             return
         }
-        let ids = files.enumerated().map { index, file in
-            var trackMeta = meta
-            trackMeta.title = MusicText.clean(file.title).isEmpty ? file.title : MusicText.clean(file.title)
-            return download(file, play: play && index == 0, meta: trackMeta)
+        for files in folders.prefix(3) {
+            let ids = files.enumerated().map { index, file in
+                var trackMeta = meta
+                let cleaned = MusicText.clean(file.title)
+                trackMeta.title = cleaned.isEmpty ? file.title : cleaned
+                return download(file, play: play && index == 0, meta: trackMeta)
+            }
+            fetches[key] = .downloading(ids)
+            if await supervise(Array(ids.prefix(1))) { return }
+            ids.forEach { cancelTransfer($0, reason: "Skipped: trying another source.") }
         }
-        fetches[key] = .downloading(ids)
+    }
+
+    /// Waits until a transfer is receiving data (true) or has failed, been
+    /// denied or not started in time (false).
+    private func supervise(_ ids: [UUID]) async -> Bool {
+        let started = Date()
+        while true {
+            try? await Task.sleep(for: .seconds(2))
+            let watched = transfers.filter { ids.contains($0.id) }
+            guard !watched.isEmpty else { return false }
+            if watched.contains(where: {
+                if case .completed = $0.state { return true }
+                return $0.received > 0
+            }) {
+                return true
+            }
+            if watched.allSatisfy({ !$0.state.isActive }) { return false }
+            let waited = Date().timeIntervalSince(started)
+            let queued = watched.contains { if case .queued = $0.state { return true } else { return false } }
+            let accepted = watched.contains { $0.token != nil }
+            // Connecting/requested: 35 s. Accepted or queued: up to 60 s.
+            if waited > (queued || accepted ? 60 : 35) { return false }
+        }
     }
 
     private func collect(key: String, query: String, enough: ([SlskSearchResult]) -> Bool) async -> [SlskSearchResult] {
@@ -265,7 +324,9 @@ final class SoulseekClient: ObservableObject {
         var score = result.freeSlots ? 1000.0 : 0
         score -= Double(min(result.queueLength, 100)) * 5
         switch result.fileExtension {
-        case "flac", "alac", "wav", "aiff", "aif": score += 200
+        case "flac", "alac", "wav", "aiff", "aif":
+            // Prefer lossless only from users fast enough to send it quickly.
+            score += result.uploadSpeed >= 150_000 ? 200 : 40
         case "mp3", "m4a", "aac", "ogg", "opus":
             let bitrate = Double(result.bitrate ?? 0)
             score += bitrate >= 320 ? 160 : bitrate >= 256 ? 120 : bitrate >= 192 ? 60 : 0
@@ -274,30 +335,32 @@ final class SoulseekClient: ObservableObject {
         return score + log10(Double(max(result.uploadSpeed, 1))) * 20
     }
 
-    private static func bestSong(in results: [SlskSearchResult], durationSeconds: Int?) -> SlskSearchResult? {
-        results
+    /// Matching files, best first, one per user.
+    private static func rankedSongs(in results: [SlskSearchResult], durationSeconds: Int?) -> [SlskSearchResult] {
+        var seenUsers = Set<String>()
+        return results
             .filter(\.isAudio)
             .filter { result in
                 guard let expected = durationSeconds, let actual = result.duration, actual > 0 else { return true }
                 return abs(Int(actual) - expected) <= 6
             }
-            .max { score($0) < score($1) }
+            .sorted { score($0) > score($1) }
+            .filter { seenUsers.insert($0.username).inserted }
     }
 
-    private static func bestFolder(in results: [SlskSearchResult], trackCount: Int?) -> [SlskSearchResult]? {
+    private static func rankedFolders(in results: [SlskSearchResult], trackCount: Int?) -> [[SlskSearchResult]] {
         let folders = Dictionary(grouping: results.filter(\.isAudio)) { result -> String in
             let path = result.filename.split(whereSeparator: { $0 == "\\" || $0 == "/" }).dropLast().joined(separator: "/")
             return result.username + "\u{1F}" + path
         }
         let minimum = max(1, Int(Double(trackCount ?? 1) * 0.7))
+        let rank: ([SlskSearchResult]) -> Double = { files in
+            Double(min(files.count, trackCount ?? files.count)) * 50 + score(files[0])
+        }
         return folders.values
             .filter { $0.count >= minimum }
-            .max { lhs, rhs in
-                let left = Double(min(lhs.count, trackCount ?? lhs.count)) * 50 + score(lhs[0])
-                let right = Double(min(rhs.count, trackCount ?? rhs.count)) * 50 + score(rhs[0])
-                return left < right
-            }?
-            .sorted { $0.filename.localizedStandardCompare($1.filename) == .orderedAscending }
+            .sorted { rank($0) > rank($1) }
+            .map { $0.sorted { $0.filename.localizedStandardCompare($1.filename) == .orderedAscending } }
     }
 
     func remove(_ id: UUID) {
@@ -328,6 +391,30 @@ final class SoulseekClient: ObservableObject {
     private func update(_ id: UUID, _ change: (inout SlskTransfer) -> Void) {
         guard let index = transfers.firstIndex(where: { $0.id == id }) else { return }
         change(&transfers[index])
+        updateBackgroundTime()
+    }
+
+    /// Asks iOS for extra time so transfers survive briefly leaving the app.
+    private func updateBackgroundTime() {
+        let active = transfers.contains { $0.state.isActive }
+        if active, backgroundTask == .invalid {
+            backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Soulseek downloads") { [weak self] in
+                Task { @MainActor in self?.endBackgroundTime() }
+            }
+        } else if !active {
+            endBackgroundTime()
+        }
+    }
+
+    private func endBackgroundTime() {
+        guard backgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTask)
+        backgroundTask = .invalid
+    }
+
+    /// Gives up on a transfer (used when switching to another source).
+    func cancelTransfer(_ id: UUID, reason: String) {
+        update(id) { if $0.state.isActive { $0.state = .failed(reason) } }
     }
 
     private func destinationURL(for result: SlskSearchResult) -> URL {
@@ -479,30 +566,76 @@ final class SoulseekClient: ObservableObject {
         Task { await readPeer(socket, username: user) }
     }
 
+    /// Connects to a peer by dialling them and, at the same time, asking the
+    /// server to have them dial us. Whichever works first wins.
     private func peerSocket(for user: String) async throws -> SlskSocket {
         if let existing = peers[user], case .ready = existing.connection.state {
             return existing
         }
-        guard let address = await peerAddress(user) else { throw ClientError.offline }
+        let token = UInt32.random(in: 1...UInt32.max)
+        let race = ConnectRace()
+        let socket: SlskSocket? = await withCheckedContinuation { continuation in
+            race.continuation = continuation
+            Task {
+                let direct = await self.directConnect(to: user)
+                if race.deliver(direct) { self.abandonPierce(token) }
+            }
+            Task {
+                let pierced = await self.indirectConnect(to: user, token: token)
+                race.deliver(pierced)
+            }
+        }
+        guard let socket else { throw ClientError.unreachable }
+        registerPeer(socket, username: user)
+        return socket
+    }
 
-        let direct = SlskSocket(host: address.0, port: address.1)
+    /// Resolves with the first socket that connects, or nil once both fail.
+    @MainActor
+    private final class ConnectRace {
+        var continuation: CheckedContinuation<SlskSocket?, Never>?
+        private var pending = 2
+
+        @discardableResult
+        func deliver(_ socket: SlskSocket?) -> Bool {
+            pending -= 1
+            if let socket {
+                guard let continuation else {
+                    socket.close() // The other route already won.
+                    return false
+                }
+                self.continuation = nil
+                continuation.resume(returning: socket)
+                return true
+            }
+            if pending == 0, let continuation {
+                self.continuation = nil
+                continuation.resume(returning: nil)
+            }
+            return false
+        }
+    }
+
+    private func directConnect(to user: String) async -> SlskSocket? {
+        guard let address = await peerAddress(user) else { return nil }
+        let socket = SlskSocket(host: address.0, port: address.1)
         do {
-            try await direct.open(timeout: 8)
-            try await direct.send(SlskWriter.initMessage(code: 1) { writer in
+            try await socket.open(timeout: 10)
+            try await socket.send(SlskWriter.initMessage(code: 1) { writer in
                 writer.string(username)
                 writer.string("P")
                 writer.u32(0)
             })
-            registerPeer(direct, username: user)
-            return direct
+            return socket
         } catch {
-            direct.close()
+            socket.close()
+            return nil
         }
+    }
 
-        // Indirect: the server asks the peer to connect to our listener.
-        guard let server else { throw ClientError.unreachable }
-        let token = UInt32.random(in: 1...UInt32.max)
-        let pierced: SlskSocket? = await withCheckedContinuation { continuation in
+    private func indirectConnect(to user: String, token: UInt32) async -> SlskSocket? {
+        guard let server else { return nil }
+        return await withCheckedContinuation { continuation in
             pierceWaiters[token] = continuation
             Task {
                 try? await server.send(SlskWriter.message(code: 18) { writer in
@@ -513,12 +646,13 @@ final class SoulseekClient: ObservableObject {
             }
             Task { [weak self] in
                 try? await Task.sleep(for: .seconds(20))
-                self?.pierceWaiters.removeValue(forKey: token)?.resume(returning: nil)
+                self?.abandonPierce(token)
             }
         }
-        guard let pierced else { throw ClientError.unreachable }
-        registerPeer(pierced, username: user)
-        return pierced
+    }
+
+    private func abandonPierce(_ token: UInt32) {
+        pierceWaiters.removeValue(forKey: token)?.resume(returning: nil)
     }
 
     private func peerAddress(_ user: String) async -> (String, UInt16)? {
@@ -686,12 +820,19 @@ final class SoulseekClient: ObservableObject {
             let id = transfer.id
             let destination = destinationURL(for: transfer.result)
 
+            // Resume after an interruption from what is already on disk.
+            let partial = destination.appendingPathExtension("part")
+            let existing = (try? FileManager.default.attributesOfItem(atPath: partial.path)[.size] as? UInt64) ?? 0
+            let resumeFrom = existing < transfer.size ? existing : 0
             var offset = SlskWriter()
-            offset.u64(0)
+            offset.u64(resumeFrom)
             try await socket.send(offset.data)
-            update(id) { $0.state = .transferring }
+            update(id) {
+                $0.state = .transferring
+                $0.received = resumeFrom
+            }
 
-            try await Self.receiveFile(from: socket, size: transfer.size, to: destination) { [weak self] received, speed in
+            try await Self.receiveFile(from: socket, size: transfer.size, offset: resumeFrom, to: destination) { [weak self] received, speed in
                 Task { @MainActor in
                     self?.update(id) {
                         $0.received = received
@@ -705,10 +846,24 @@ final class SoulseekClient: ObservableObject {
                 $0.state = .completed(destination)
             }
             let play = transfers.first(where: { $0.id == id })?.playWhenFinished ?? false
+            resumeAttempts[id] = nil
             onDownloadFinished?(destination, play, transferMeta.removeValue(forKey: id))
         } catch {
             socket.close()
-            if let transferID {
+            guard let transferID else { return }
+            // Ask the uploader again and continue from the partial file.
+            let attempts = resumeAttempts[transferID, default: 0]
+            if attempts < 3, transfers.first(where: { $0.id == transferID })?.state.isActive == true {
+                resumeAttempts[transferID] = attempts + 1
+                update(transferID) {
+                    $0.state = .connecting
+                    $0.token = nil
+                }
+                Task {
+                    try? await Task.sleep(for: .seconds(2))
+                    await requestDownload(transferID)
+                }
+            } else {
                 update(transferID) { $0.state = .failed("The transfer was interrupted. Tap to retry.") }
             }
         }
@@ -717,16 +872,21 @@ final class SoulseekClient: ObservableObject {
     nonisolated private static func receiveFile(
         from socket: SlskSocket,
         size: UInt64,
+        offset: UInt64,
         to destination: URL,
         progress: @escaping @Sendable (UInt64, Double) -> Void
     ) async throws {
         let fileManager = FileManager.default
         try fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         let partial = destination.appendingPathExtension("part")
-        fileManager.createFile(atPath: partial.path, contents: nil)
+        if offset == 0 || !fileManager.fileExists(atPath: partial.path) {
+            fileManager.createFile(atPath: partial.path, contents: nil)
+        }
         let handle = try FileHandle(forWritingTo: partial)
+        try handle.truncate(atOffset: offset)
+        try handle.seek(toOffset: offset)
 
-        var received: UInt64 = 0
+        var received: UInt64 = offset
         var reportedAt = Date()
         var bytesSinceReport: UInt64 = 0
         var smoothedSpeed: Double?
