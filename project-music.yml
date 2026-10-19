@@ -1,0 +1,46 @@
+name: PlayboxMusic
+options:
+  bundleIdPrefix: com.playboxapp
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+packages:
+  VLCKit:
+    url: https://github.com/videolan/vlckit.git
+    revision: 2e0868f5ed40fe59cd92f377645fdcc260c6e759
+targets:
+  PlayboxMusic:
+    type: application
+    platform: iOS
+    sources:
+      - path: PlayboxMusic
+    dependencies:
+      - package: VLCKit
+        product: VLCKit
+    info:
+      path: PlayboxMusic/Info.plist
+      properties:
+        CFBundleDisplayName: Playbox Music
+        UIBackgroundModes: [audio]
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        NSLocalNetworkUsageDescription: Playbox Music accepts incoming Soulseek peer connections for searches and downloads.
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.playboxapp.music
+        GENERATE_INFOPLIST_FILE: YES
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGNING_ALLOWED: NO
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
+        SWIFT_EMIT_LOC_STRINGS: YES
+        ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: NO
+        SWIFT_COMPILATION_MODE: wholemodule
+        DEAD_CODE_STRIPPING: YES

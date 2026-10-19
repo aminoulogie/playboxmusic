@@ -1,0 +1,117 @@
+name: Build Playbox Music IPA
+
+# Playbox Music is a separate app with its own project spec, IPA and releases.
+# It does not use libtorrent, so this build skips the native compile.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, for example 1.0.1. Leave blank for automatic versioning."
+        required: false
+        type: string
+  push:
+    # Branch builds validate only; releases are created from main.
+    branches: [main, 'claude/**']
+    paths:
+      - 'PlayboxMusic/**'
+      - 'project-music.yml'
+      - '.github/workflows/build-music-ipa.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Resolve release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          INPUT_VERSION="${{ inputs.version }}"
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="${INPUT_VERSION#v}"
+          else
+            VERSION="1.0.${GITHUB_RUN_NUMBER}"
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+([.][0-9]+){1,2}$ ]]; then
+            echo "Invalid release version: $VERSION"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Resolved release version: $VERSION"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project-music.yml
+
+      - name: Build for physical iPhone (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project PlayboxMusic.xcodeproj \
+            -scheme PlayboxMusic \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            INFOPLIST_KEY_CFBundleShortVersionString="$VERSION" \
+            INFOPLIST_KEY_CFBundleVersion="${{ github.run_number }}" \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/PlayboxMusic.app"
+          test -d "$APP"
+          mkdir -p "$RUNNER_TEMP/package/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/package/Payload/"
+          (cd "$RUNNER_TEMP/package" && zip -qry "$GITHUB_WORKSPACE/PlayboxMusic-v${VERSION}.ipa" Payload)
+          cp "$GITHUB_WORKSPACE/PlayboxMusic-v${VERSION}.ipa" "$GITHUB_WORKSPACE/PlayboxMusic-latest.ipa"
+          ls -lh "PlayboxMusic-v${VERSION}.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlayboxMusic-unsigned-IPA
+          path: PlayboxMusic-v*.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      # Tags start with "music-" and titles avoid the word "Latest", which the
+      # Playbox video workflow uses to find and replace its own stable release.
+      - name: Create versioned GitHub Release
+        if: success() && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "music-v${VERSION}" "PlayboxMusic-v${VERSION}.ipa" \
+            --target "${GITHUB_SHA}" \
+            --title "Playbox Music v${VERSION}" \
+            --notes "Automated Playbox Music iOS build (Soulseek). Version ${VERSION}. Commit: ${GITHUB_SHA}."
+
+      - name: Update stable music release
+        if: success() && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view music-current >/dev/null 2>&1; then
+            gh release delete music-current --cleanup-tag -y
+          fi
+          gh release create music-current PlayboxMusic-latest.ipa \
+            --target "${GITHUB_SHA}" \
+            --title "Playbox Music v${VERSION} (current)" \
+            --notes "Current Playbox Music IPA. Version ${VERSION}. Commit: ${GITHUB_SHA}."
