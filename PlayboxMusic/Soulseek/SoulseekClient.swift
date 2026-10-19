@@ -615,6 +615,7 @@ final class SoulseekClient: ObservableObject {
         var received: UInt64 = 0
         var reportedAt = Date()
         var bytesSinceReport: UInt64 = 0
+        var smoothedSpeed: Double?
         do {
             while received < size {
                 let wanted = Int(min(UInt64(256 * 1024), size - received))
@@ -624,8 +625,13 @@ final class SoulseekClient: ObservableObject {
                 received += UInt64(chunk.count)
                 bytesSinceReport += UInt64(chunk.count)
                 let elapsed = Date().timeIntervalSince(reportedAt)
-                if elapsed >= 0.3 {
-                    progress(received, Double(bytesSinceReport) / elapsed)
+                // Report every 50 ms. A 50 ms sample is noisy, so the shown speed
+                // is an exponential moving average (roughly the last second).
+                if elapsed >= 0.05 {
+                    let sample = Double(bytesSinceReport) / elapsed
+                    let speed = smoothedSpeed.map { $0 + (sample - $0) * min(1, elapsed / 1.0) } ?? sample
+                    smoothedSpeed = speed
+                    progress(received, speed)
                     reportedAt = Date()
                     bytesSinceReport = 0
                 }

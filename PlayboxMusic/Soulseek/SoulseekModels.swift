@@ -92,10 +92,13 @@ struct SlskTransfer: Identifiable, Equatable, Sendable {
         case .queued(let position):
             position.map { "Queued · position \($0)" } ?? "Queued by \(result.username)"
         case .transferring:
-            String(format: "%.0f%% · ", progress * 100) +
-                ByteCountFormatter.string(fromByteCount: Int64(bytesPerSecond), countStyle: .file) + "/s"
+            "\(String(format: "%.1f%%", progress * 100)) · \(Self.bytes(received)) of \(Self.bytes(size)) · \(Self.bytes(UInt64(max(0, bytesPerSecond))))/s"
         case .completed: "Downloaded"
         case .failed(let reason): reason
         }
+    }
+
+    private static func bytes(_ count: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(clamping: count), countStyle: .file)
     }
 }

@@ -18,6 +18,7 @@ struct DownloadsView: View {
                         }
                         Text(transfer.statusText)
                             .font(.caption)
+                            .monospacedDigit()
                             .foregroundStyle(statusColor(transfer.state))
                     }
                 }
