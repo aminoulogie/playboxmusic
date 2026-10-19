@@ -83,7 +83,7 @@ final class MixSettings: ObservableObject {
         }
     }
 
-    static func pairKey(_ from: Track, _ to: Track) -> String {
+    nonisolated static func pairKey(_ from: Track, _ to: Track) -> String {
         from.url.lastPathComponent + "→" + to.url.lastPathComponent
     }
 
