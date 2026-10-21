@@ -1,18 +1,20 @@
 import AVFoundation
 import Combine
 import MediaPlayer
+import SwiftUI
 import UIKit
 import VLCKit
 
 /// One playback lane: player → time-pitch (beat matching) → gain trim
-/// (volume matching) → fader (crossfades).
+/// (volume matching) → DJ filters → echo → fader (crossfades).
 @MainActor
 private final class AudioDeck {
     let player = AVAudioPlayerNode()
     let timePitch = AVAudioUnitTimePitch()
     let trim = AVAudioUnitEQ(numberOfBands: 0)
-    /// High-pass filter for DJ-style blends (bass swap, filter sweep).
-    let filter = AVAudioUnitEQ(numberOfBands: 1)
+    /// High-pass, low-pass and a bass-kill shelf for Spotify-style mixes.
+    let filter = AVAudioUnitEQ(numberOfBands: 3)
+    let delay = AVAudioUnitDelay()
     let fader = AVAudioMixerNode()
     private(set) var file: AVAudioFile?
     private(set) var url: URL?
@@ -37,15 +39,27 @@ private final class AudioDeck {
     }
 
     func attach(to engine: AVAudioEngine, output: AVAudioNode) {
-        [player, timePitch, trim, filter, fader].forEach(engine.attach)
-        let band = filter.bands[0]
-        band.filterType = .highPass
-        band.frequency = 20
-        band.bandwidth = 0.5
-        filter.bypass = true
+        [player, timePitch, trim, filter, delay, fader].forEach(engine.attach)
+        let highPass = filter.bands[0]
+        highPass.filterType = .highPass
+        highPass.frequency = 20
+        highPass.bandwidth = 0.5
+        let lowPass = filter.bands[1]
+        lowPass.filterType = .lowPass
+        lowPass.frequency = 20000
+        lowPass.bandwidth = 0.5
+        let bass = filter.bands[2]
+        bass.filterType = .lowShelf
+        bass.frequency = 220
+        bass.gain = 0
+        delay.feedback = 50
+        delay.lowPassCutoff = 6000
+        delay.wetDryMix = 0
+        resetEffects()
         engine.connect(timePitch, to: trim, format: nil)
         engine.connect(trim, to: filter, format: nil)
-        engine.connect(filter, to: fader, format: nil)
+        engine.connect(filter, to: delay, format: nil)
+        engine.connect(delay, to: fader, format: nil)
         engine.connect(fader, to: output, format: nil)
     }
 
@@ -80,8 +94,36 @@ private final class AudioDeck {
 
     /// Sets the high-pass cutoff; below ~25 Hz the filter is bypassed.
     func setHighPass(_ frequency: Float) {
-        filter.bypass = frequency < 25
-        filter.bands[0].frequency = max(20, frequency)
+        filter.bands[0].bypass = frequency < 25
+        filter.bands[0].frequency = min(20000, max(20, frequency))
+    }
+
+    /// Sets the low-pass cutoff; from ~19 kHz up the filter is bypassed.
+    func setLowPass(_ frequency: Float) {
+        filter.bands[1].bypass = frequency >= 19000
+        filter.bands[1].frequency = min(20000, max(40, frequency))
+    }
+
+    /// Bass level from 0 (killed, like a DJ mixer's low EQ) to 1 (full).
+    func setBass(_ level: Double) {
+        filter.bands[2].bypass = level >= 0.999
+        filter.bands[2].gain = Float(-30 * (1 - min(max(level, 0), 1)))
+    }
+
+    /// Echo amount 0…1 with repeats on a dotted eighth of the beat.
+    func setEcho(_ amount: Double, beat: Double = 0.5) {
+        delay.bypass = amount <= 0.005
+        delay.delayTime = TimeInterval(min(2, max(0.05, beat * 0.75)))
+        delay.wetDryMix = Float(50 * min(max(amount, 0), 1))
+    }
+
+    func resetEffects() {
+        fader.outputVolume = 1
+        player.volume = 1
+        setHighPass(0)
+        setLowPass(20000)
+        setBass(1)
+        setEcho(0)
     }
 
     // An idle deck has no connected input; pausing or playing it would
@@ -103,10 +145,9 @@ private final class AudioDeck {
         player.stop()
         pausedAt = nil
         segmentStart = 0
-        fader.outputVolume = 1
         timePitch.rate = 1
         trim.globalGain = 0
-        setHighPass(0)
+        resetEffects()
     }
 
     func unload() {
@@ -122,6 +163,8 @@ private final class AudioDeck {
 final class PlaybackClock: ObservableObject {
     @Published fileprivate(set) var elapsed: Double = 0
     @Published fileprivate(set) var duration: Double = 0
+    /// Progress 0…1 through the transition while two songs are mixing.
+    @Published fileprivate(set) var mixProgress: Double?
     fileprivate(set) var updatedAt = Date()
     fileprivate(set) var running = false
 
@@ -159,6 +202,11 @@ final class MusicPlayer: ObservableObject {
     @Published private(set) var queue: [Track] = []
     @Published private(set) var index = 0
     @Published private(set) var artwork: UIImage?
+    /// A deep colour taken from the artwork, for backgrounds.
+    @Published private(set) var artworkColor: Color?
+    /// +1 when moving forward through the queue, -1 when going back, so
+    /// covers and titles slide the right way.
+    @Published private(set) var skipDirection = 1
     @Published private(set) var currentMeta: TrackMeta?
     @Published private(set) var shuffle = false
     @Published private(set) var repeatMode: RepeatMode = .off
@@ -229,6 +277,7 @@ final class MusicPlayer: ObservableObject {
     func play(_ tracks: [Track], startAt start: Int) {
         guard tracks.indices.contains(start) else { return }
         originalOrder = nil
+        skipDirection = 1
         queue = tracks
         index = start
         if shuffle { shuffleUpcoming() }
@@ -322,6 +371,7 @@ final class MusicPlayer: ObservableObject {
 
     func next() {
         cancelMix()
+        skipDirection = 1
         if index + 1 < queue.count {
             index += 1
         } else if repeatMode == .all, !queue.isEmpty {
@@ -339,6 +389,7 @@ final class MusicPlayer: ObservableObject {
         if elapsed > 3 || index == 0 {
             seek(to: 0)
         } else {
+            skipDirection = -1
             index -= 1
             startCurrent(from: 0)
         }
@@ -358,6 +409,90 @@ final class MusicPlayer: ObservableObject {
         }
         clock.set(elapsed: target, duration: duration, running: isPlaying)
         updateNowPlaying()
+        // A started (or cancelled) mix used up the plan; plan it again.
+        if nextPlan == nil { preparePlan() }
+    }
+
+    /// Plays a transition from two bars before it starts, so it can be heard.
+    func previewTransition(from: Track, to: Track, at seconds: Double) {
+        let start = max(0, seconds)
+        if current == from, upcoming == to, vlc == nil, deck.file != nil, deck.duration > 0 {
+            userPaused = false
+            if !engine.isRunning { try? engine.start() }
+            seek(to: start / deck.duration)
+            if !deck.isActive { decks.forEach { $0.resume() } }
+            refresh()
+            return
+        }
+        if let position = queue.firstIndex(of: from), queue[safe: position + 1] == to {
+            index = position
+        } else {
+            originalOrder = nil
+            queue = [from, to]
+            index = 0
+        }
+        startCurrent(from: start)
+    }
+
+    enum QueueOrder: String, CaseIterable, Identifiable {
+        case tempo = "Tempo (BPM)"
+        case key = "Key"
+        case harmonic = "Smart mix order"
+        var id: String { rawValue }
+    }
+
+    /// Reorders the songs after the current one, like a DJ planning a set.
+    func sortUpcoming(_ order: QueueOrder) async {
+        guard index + 1 < queue.count else { return }
+        let before = queue
+        let start = queue[index]
+        let rest = Array(queue[(index + 1)...])
+        var facts: [Track: TrackAnalysis] = [:]
+        for track in [start] + rest {
+            if let analysis = await TrackAnalyzer.shared.analysis(for: track.url) { facts[track] = analysis }
+        }
+        guard queue == before else { return }
+        let sorted: [Track]
+        switch order {
+        case .tempo:
+            sorted = rest.sorted { (facts[$0]?.bpm ?? .infinity) < (facts[$1]?.bpm ?? .infinity) }
+        case .key:
+            sorted = rest.sorted { a, b in
+                let x = facts[a]?.key, y = facts[b]?.key
+                return (x?.camelotNumber ?? 99, x?.minor == false ? 1 : 0)
+                    < (y?.camelotNumber ?? 99, y?.minor == false ? 1 : 0)
+            }
+        case .harmonic:
+            // Greedy chain: each next song has a compatible key and the
+            // closest tempo to the one before it.
+            var remaining = rest
+            var chain: [Track] = []
+            var last = facts[start]
+            while !remaining.isEmpty {
+                let pick = remaining.indices.min { lhs, rhs in
+                    Self.mixCost(last, facts[remaining[lhs]]) < Self.mixCost(last, facts[remaining[rhs]])
+                }!
+                let track = remaining.remove(at: pick)
+                chain.append(track)
+                last = facts[track] ?? last
+            }
+            sorted = chain
+        }
+        originalOrder = nil
+        shuffle = false
+        queue.replaceSubrange((index + 1)..., with: sorted)
+        preparePlan()
+    }
+
+    private static func mixCost(_ a: TrackAnalysis?, _ b: TrackAnalysis?) -> Double {
+        guard let b else { return 1000 }
+        var cost = 0.0
+        if let x = a?.key, let y = b.key, !x.isCompatible(with: y) { cost += 12 }
+        if let x = a?.bpm, let y = b.bpm {
+            let ratio = max(x, y) / min(x, y)
+            cost += min(abs(ratio - 1), abs(ratio - 2)) * 100
+        }
+        return cost
     }
 
     private func stop() {
@@ -369,6 +504,7 @@ final class MusicPlayer: ObservableObject {
         current = nil
         currentMeta = nil
         artwork = nil
+        artworkColor = nil
         isPlaying = false
         clock.set(elapsed: 0, duration: 0, running: false)
         nextPlan = nil
@@ -437,6 +573,7 @@ final class MusicPlayer: ObservableObject {
 
     private func trackEnded() {
         guard !isMixing else { return }
+        skipDirection = 1
         if repeatMode == .one {
             startCurrent(from: 0)
         } else if index + 1 < queue.count {
@@ -475,6 +612,7 @@ final class MusicPlayer: ObservableObject {
         guard vlc == nil, repeatMode != .one, let from = current, let to = upcoming,
               Self.engineReadable(to.url) else { return }
         let outDuration = deck.duration
+        guard mix.isOn else { return }
         planTask = Task { [weak self] in
             async let outAnalysis = TrackAnalyzer.shared.analysis(for: from.url)
             async let inAnalysis = TrackAnalyzer.shared.analysis(for: to.url)
@@ -492,43 +630,61 @@ final class MusicPlayer: ObservableObject {
         guard let next = upcoming else { return }
         let incoming = otherDeck
         do { try incoming.load(next.url, engine: engine) } catch { return }
-        incoming.fader.outputVolume = 0
         incoming.trim.globalGain = plan.inGain
         deck.trim.globalGain = plan.outGain
         incoming.timePitch.rate = plan.inRate
-        incoming.play(from: plan.entry) { [weak self] in self?.trackEnded() }
+        deck.setEcho(0, beat: plan.beat)
         mixPlan = plan
-        mixStartedAt = Date()
         isMixing = true
+        applyAutomation(plan, at: 0)
+        incoming.play(from: plan.entry) { [weak self] in self?.trackEnded() }
+        // Start the clock from where the outgoing song really is, so the
+        // blend stays on the beat grid even if this tick ran late.
+        mixStartedAt = Date().addingTimeInterval(-max(0, deck.currentTime - plan.mixStart))
+    }
+
+    /// Sets volume, bass EQ and effects for both decks at progress t.
+    private func applyAutomation(_ plan: TransitionPlan, at t: Double) {
+        let outgoing = deck, incoming = otherDeck
+        let gains = plan.volume.gains(t)
+        let amount = plan.effect.amount(t)
+        if plan.effect == .echo {
+            // Cut the dry signal but keep the echoes ringing, then fade them.
+            outgoing.player.volume = gains.out
+            outgoing.fader.outputVolume = Float(1 - smoothstep(0.75, 1, t))
+            outgoing.setEcho(amount, beat: plan.beat)
+        } else {
+            outgoing.fader.outputVolume = gains.out
+        }
+        incoming.fader.outputVolume = gains.in
+        let bass = plan.eq.bass(t, beatFraction: plan.length > 0 ? plan.beat / plan.length : 0.1)
+        outgoing.setBass(bass.out)
+        incoming.setBass(bass.in)
+        switch plan.effect {
+        case .lowPass:
+            // Opens from 250 Hz to the full range: the incoming song rises in.
+            incoming.setLowPass(Float(250 * pow(80, 1 - amount)))
+        case .highPass:
+            outgoing.setHighPass(Float(20 * pow(100, amount)))
+        case .echo, .none:
+            break
+        }
     }
 
     private func advanceMix(now: Date) {
         guard let plan = mixPlan, let started = mixStartedAt else { return }
         let t = plan.length > 0 ? now.timeIntervalSince(started) / plan.length : 1
-        let gains = plan.curve.gains(t)
-        deck.fader.outputVolume = gains.out
-        otherDeck.fader.outputVolume = gains.in
-        switch plan.style {
-        case .crossfade:
-            break
-        case .bassSwap:
-            // Like a DJ: the incoming song plays without bass, then the
-            // basslines swap at the midpoint over about half a second.
-            let swap = min(1, max(0, (t - 0.5) / max(0.05, 0.5 / max(plan.length, 1))))
-            otherDeck.setHighPass(Float(350 - 330 * swap))
-            deck.setHighPass(Float(20 + 330 * swap))
-        case .filterSweep:
-            // The outgoing song is filtered away from the bottom up.
-            deck.setHighPass(Float(20 * pow(60, t)))
-            otherDeck.setHighPass(t < 0.3 ? 250 : 0)
-        }
+        applyAutomation(plan, at: t)
+        let shown = (min(max(t, 0), 1) * 100).rounded() / 100
+        if clock.mixProgress != shown { clock.mixProgress = shown }
         guard t >= 1 else { return }
 
         // Hand over to the incoming deck.
         deck.unload()
         active = 1 - active
-        deck.fader.outputVolume = 1
-        deck.setHighPass(0)
+        deck.resetEffects()
+        clock.mixProgress = nil
+        skipDirection = 1
         index += 1
         isMixing = false
         mixPlan = nil
@@ -541,8 +697,8 @@ final class MusicPlayer: ObservableObject {
     private func cancelMix() {
         guard isMixing else { return }
         otherDeck.unload()
-        deck.fader.outputVolume = 1
-        deck.setHighPass(0)
+        deck.resetEffects()
+        clock.mixProgress = nil
         isMixing = false
         mixPlan = nil
         mixStartedAt = nil
@@ -555,7 +711,9 @@ final class MusicPlayer: ObservableObject {
         tickTask = Task { [weak self] in
             while !Task.isCancelled {
                 self?.tick()
-                do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
+                // Automation runs finer while two songs are blending.
+                let interval = self?.isMixing == true ? 20 : 50
+                do { try await Task.sleep(for: .milliseconds(interval)) } catch { return }
             }
         }
     }
@@ -634,8 +792,10 @@ final class MusicPlayer: ObservableObject {
         let meta = currentMeta
         Task { [weak self] in
             let image = await ArtworkResolver.shared.image(for: track, meta: meta)
+            let color = await Task.detached(priority: .userInitiated) { image.flatMap(ArtworkPalette.color) }.value
             guard let self, self.current == track else { return }
             self.artwork = image
+            self.artworkColor = color
             self.updateNowPlaying()
         }
     }

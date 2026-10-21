@@ -2,10 +2,11 @@ import AVKit
 import MediaPlayer
 import SwiftUI
 
-/// Black page with a large rounded cover, title with artist and album
-/// below, transport, volume and quick access to lyrics, mix, EQ and queue.
-/// Fast-changing parts (time, lyrics, cover drag) are separate views so
-/// only they redraw, keeping scrolling and gestures at 120 Hz.
+/// Full-screen player: artwork-tinted background, a large cover that
+/// slides in the direction you skip and settles back when paused, title
+/// with tempo and key, transport, volume and quick access to lyrics, the
+/// transition editor, EQ and Up Next. Fast-changing parts (time, lyrics,
+/// mix progress, cover drag) are separate views so only they redraw.
 struct NowPlayingView: View {
     @EnvironmentObject private var player: MusicPlayer
     @EnvironmentObject private var library: MusicLibrary
@@ -23,41 +24,51 @@ struct NowPlayingView: View {
 
     private var isFavourite: Bool { player.current.map(library.isFavourite) ?? false }
 
+    private var slide: AnyTransition {
+        let distance: CGFloat = player.skipDirection >= 0 ? 360 : -360
+        return .asymmetric(
+            insertion: .offset(x: distance).combined(with: .opacity).combined(with: .scale(scale: 0.92)),
+            removal: .offset(x: -distance).combined(with: .opacity).combined(with: .scale(scale: 0.92))
+        )
+    }
+
     var body: some View {
         GeometryReader { proxy in
             let side = min(proxy.size.width - 48, proxy.size.height * 0.42)
             VStack(spacing: 0) {
                 topBar
-                Spacer(minLength: 24)
+                Spacer(minLength: 20)
                 ZStack {
                     if showLyrics {
                         LyricsPanel(lyrics: lyrics, loading: lyricsLoading, clock: player.clock) { time in
                             if player.duration > 0 { player.seek(to: time / player.duration) }
                         }
                         .frame(width: proxy.size.width - 48, height: side)
-                        .transition(.opacity)
+                        .transition(.opacity.combined(with: .scale(scale: 0.96)))
                     } else {
                         CoverView(side: side, coverMenu: { coverMenu }, onLike: like)
-                            .transition(.opacity)
+                            .id(player.current)
+                            .transition(slide)
                     }
                 }
                 .frame(height: side)
+                .animation(.spring(response: 0.5, dampingFraction: 0.86), value: player.current)
                 Spacer(minLength: 20)
                 titleRow
                 TimeBar(clock: player.clock) { player.seek(to: $0) }
-                    .padding(.top, 14)
-                transport
                     .padding(.top, 12)
+                transport
+                    .padding(.top, 10)
                 volume
-                    .padding(.top, 18)
-                bottomBar
                     .padding(.top, 16)
+                bottomBar
+                    .padding(.top, 14)
                     .padding(.bottom, 8)
             }
             .padding(.horizontal, 24)
             .frame(width: proxy.size.width)
         }
-        .background(Color.black.ignoresSafeArea())
+        .background { backdrop }
         .foregroundStyle(.white)
         .preferredColorScheme(.dark)
         .presentationBackground(.black)
@@ -68,7 +79,17 @@ struct NowPlayingView: View {
             Group {
                 switch sheet {
                 case .queue: QueueView()
-                case .mix: MixSheet()
+                case .mix:
+                    if let from = player.current, let to = player.upcoming {
+                        TransitionEditorView(pair: TransitionPair(from: from, to: to))
+                    } else {
+                        NavigationStack {
+                            Form { MixSettingsForm(mix: player.mix) }
+                                .navigationTitle("Mix")
+                                .navigationBarTitleDisplayMode(.inline)
+                        }
+                        .presentationDetents([.medium, .large])
+                    }
                 case .equalizer: EqualizerView()
                 case .album: AlbumLookupView(meta: player.currentMeta, fallbackTitle: player.title)
                 }
@@ -82,6 +103,20 @@ struct NowPlayingView: View {
 
     // MARK: Sections
 
+    private var backdrop: some View {
+        let tint = player.artworkColor ?? Color(white: 0.22)
+        return ZStack {
+            Color.black
+            LinearGradient(stops: [
+                .init(color: tint, location: 0),
+                .init(color: tint.opacity(0.55), location: 0.45),
+                .init(color: .black, location: 1)
+            ], startPoint: .top, endPoint: .bottom)
+        }
+        .ignoresSafeArea()
+        .animation(.easeInOut(duration: 0.9), value: player.artworkColor)
+    }
+
     private var topBar: some View {
         HStack {
             Button { dismiss() } label: {
@@ -89,11 +124,7 @@ struct NowPlayingView: View {
             }
             .accessibilityLabel("Close Now Playing")
             Spacer()
-            if player.isMixing {
-                Label("Mixing", systemImage: "waveform.path")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.white.opacity(0.7))
-            }
+            MixStatusPill(clock: player.clock) { sheet = .mix }
             Spacer()
             Menu {
                 coverMenu
@@ -112,6 +143,9 @@ struct NowPlayingView: View {
             Button { player.addToQueue(track) } label: { Label("Add to Queue", systemImage: "text.append") }
         }
         Button { sheet = .queue } label: { Label("Up Next", systemImage: "list.bullet") }
+        if player.upcoming != nil {
+            Button { sheet = .mix } label: { Label("Edit Transition", systemImage: "slider.horizontal.3") }
+        }
         Button { toggleFavourite() } label: {
             Label(isFavourite ? "Remove from Favourites" : "Add to Favourites",
                   systemImage: isFavourite ? "heart.slash" : "heart")
@@ -119,80 +153,85 @@ struct NowPlayingView: View {
     }
 
     private var titleRow: some View {
-        HStack(spacing: 8) {
-            Button { toggleFavourite() } label: {
-                Image(systemName: isFavourite ? "heart.fill" : "heart")
-                    .font(.title3)
-                    .foregroundStyle(isFavourite ? .pink : .white.opacity(0.7))
-                    .frame(width: 44, height: 44)
-                    .symbolEffect(.bounce, value: isFavourite)
-            }
-            .accessibilityLabel(isFavourite ? "Remove from Favourites" : "Add to Favourites")
-
-            // Title, then artist and album underneath, like Apple Music.
-            VStack(spacing: 3) {
+        HStack(alignment: .center, spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text(player.title)
-                    .font(.title3.weight(.bold))
+                    .font(.title2.weight(.bold))
                     .lineLimit(1)
                 Text(player.subtitle)
-                    .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.55))
+                    .font(.body)
+                    .foregroundStyle(.white.opacity(0.65))
                     .lineLimit(1)
-            }
-            .frame(maxWidth: .infinity)
-            .multilineTextAlignment(.center)
-
-            Group {
-                if player.isLossless {
-                    Image(systemName: "waveform")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(.white.opacity(0.7))
-                        .accessibilityLabel("Lossless")
-                } else {
-                    Color.clear
+                if let track = player.current {
+                    NowPlayingFacts(track: track, lossless: player.isLossless)
+                        .padding(.top, 2)
                 }
             }
-            .frame(width: 44, height: 44)
+            .id(player.current)
+            .transition(.blurReplace)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button { toggleFavourite() } label: {
+                Image(systemName: isFavourite ? "heart.fill" : "heart")
+                    .font(.title2)
+                    .foregroundStyle(isFavourite ? Color.brand : .white.opacity(0.8))
+                    .frame(width: 44, height: 44)
+                    .symbolEffect(.bounce, value: isFavourite)
+                    .contentTransition(.symbolEffect(.replace))
+            }
+            .accessibilityLabel(isFavourite ? "Remove from Favourites" : "Add to Favourites")
         }
+        .animation(.snappy(duration: 0.35), value: player.current)
     }
 
     private var transport: some View {
         HStack {
-            Button { player.toggleShuffle() } label: {
-                Image(systemName: "shuffle")
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(player.shuffle ? Color.accentColor : .white.opacity(0.6))
-                    .frame(width: 44, height: 44)
-            }
-            .accessibilityLabel(player.shuffle ? "Shuffle on" : "Shuffle off")
+            toggleButton("shuffle", on: player.shuffle) { player.toggleShuffle() }
+                .accessibilityLabel(player.shuffle ? "Shuffle on" : "Shuffle off")
             Spacer()
-            Button { player.previous() } label: { Image(systemName: "backward.fill").font(.title) }
+            Button { player.previous() } label: { Image(systemName: "backward.end.fill").font(.system(size: 30)) }
                 .buttonStyle(PressScaleStyle())
                 .accessibilityLabel("Previous track")
             Spacer()
             Button { player.togglePlayback() } label: {
                 Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.system(size: 50))
-                    .frame(width: 70, height: 70)
+                    .font(.system(size: 30, weight: .bold))
+                    .foregroundStyle(.black)
+                    .frame(width: 72, height: 72)
+                    .background(.white, in: Circle())
+                    .shadow(color: (player.artworkColor ?? .black).opacity(0.6), radius: 16, y: 6)
                     .contentTransition(.symbolEffect(.replace.downUp))
             }
             .buttonStyle(PressScaleStyle())
             .accessibilityLabel(player.isPlaying ? "Pause" : "Play")
             Spacer()
-            Button { player.next() } label: { Image(systemName: "forward.fill").font(.title) }
+            Button { player.next() } label: { Image(systemName: "forward.end.fill").font(.system(size: 30)) }
                 .buttonStyle(PressScaleStyle())
                 .accessibilityLabel("Next track")
             Spacer()
-            Button { player.cycleRepeat() } label: {
-                Image(systemName: player.repeatMode == .one ? "repeat.1" : "repeat")
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(player.repeatMode == .off ? .white.opacity(0.6) : Color.accentColor)
-                    .frame(width: 44, height: 44)
+            toggleButton(player.repeatMode == .one ? "repeat.1" : "repeat", on: player.repeatMode != .off) {
+                player.cycleRepeat()
             }
             .accessibilityLabel("Repeat \(player.repeatMode.rawValue)")
         }
         .sensoryFeedback(.selection, trigger: player.shuffle)
         .sensoryFeedback(.selection, trigger: player.repeatMode)
+    }
+
+    /// Shuffle and repeat: green with a dot underneath when on, like Spotify.
+    private func toggleButton(_ symbol: String, on: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 3) {
+                Image(systemName: symbol)
+                    .font(.title3.weight(.semibold))
+                    .contentTransition(.symbolEffect(.replace))
+                Circle().frame(width: 4, height: 4).opacity(on ? 1 : 0)
+            }
+            .foregroundStyle(on ? Color.brand : .white.opacity(0.75))
+            .frame(width: 44, height: 50)
+            .animation(.snappy(duration: 0.2), value: on)
+        }
+        .buttonStyle(PressScaleStyle())
     }
 
     private var volume: some View {
@@ -206,11 +245,12 @@ struct NowPlayingView: View {
     private var bottomBar: some View {
         HStack {
             Button {
-                withAnimation(.easeInOut(duration: 0.2)) { showLyrics.toggle() }
+                withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) { showLyrics.toggle() }
             } label: {
                 Image(systemName: showLyrics ? "quote.bubble.fill" : "quote.bubble")
-                    .foregroundStyle(showLyrics ? Color.accentColor : .white.opacity(0.7))
+                    .foregroundStyle(showLyrics ? Color.brand : .white.opacity(0.75))
                     .frame(width: 44, height: 44)
+                    .contentTransition(.symbolEffect(.replace))
             }
             .accessibilityLabel(showLyrics ? "Hide lyrics" : "Show lyrics")
             Spacer()
@@ -218,17 +258,17 @@ struct NowPlayingView: View {
             Spacer()
             Button { sheet = .equalizer } label: {
                 Image(systemName: "slider.vertical.3")
-                    .foregroundStyle(player.equalizer.enabled ? Color.accentColor : .white.opacity(0.7))
+                    .foregroundStyle(player.equalizer.enabled ? Color.brand : .white.opacity(0.75))
                     .frame(width: 44, height: 44)
             }
             .accessibilityLabel("Equalizer")
             Spacer()
             Button { sheet = .mix } label: {
-                Image(systemName: "point.3.filled.connected.trianglepath.dotted")
-                    .foregroundStyle(player.mix.mode == .off ? .white.opacity(0.7) : Color.accentColor)
+                Image(systemName: "slider.horizontal.3")
+                    .foregroundStyle(player.mix.isOn ? Color.brand : .white.opacity(0.75))
                     .frame(width: 44, height: 44)
             }
-            .accessibilityLabel("Mix settings")
+            .accessibilityLabel("Edit transition")
             Spacer()
             Button { sheet = .queue } label: {
                 Image(systemName: "list.bullet").frame(width: 44, height: 44)
@@ -236,6 +276,7 @@ struct NowPlayingView: View {
             .accessibilityLabel("Up next")
         }
         .font(.title3)
+        .buttonStyle(PressScaleStyle())
     }
 
     @ViewBuilder
@@ -283,6 +324,89 @@ struct NowPlayingView: View {
     }
 }
 
+/// Top-of-player status: what's mixing in (with live progress), the next
+/// transition, or just "Now Playing". Tap to open the transition editor.
+private struct MixStatusPill: View {
+    @EnvironmentObject private var player: MusicPlayer
+    @EnvironmentObject private var library: MusicLibrary
+    @ObservedObject var clock: PlaybackClock
+    let onTap: () -> Void
+
+    var body: some View {
+        Group {
+            if player.isMixing, let next = player.upcoming {
+                pill(progress: clock.mixProgress) {
+                    PlayingBars(active: true, color: .black)
+                    Text("Mixing into \(library.title(of: next))").lineLimit(1)
+                }
+                .foregroundStyle(.black)
+                .background(Color.brand, in: Capsule())
+            } else if player.mix.isOn, let plan = player.nextPlan {
+                pill(progress: nil) {
+                    Image(systemName: "sparkles")
+                    Text("Next: \(plan.preset?.rawValue ?? "Custom") · \(plan.bars) bars")
+                }
+                .foregroundStyle(.white)
+                .background(.white.opacity(0.14), in: Capsule())
+            } else {
+                Text("NOW PLAYING")
+                    .font(.caption.weight(.bold))
+                    .tracking(1.2)
+                    .foregroundStyle(.white.opacity(0.7))
+            }
+        }
+        .animation(.snappy, value: player.isMixing)
+        .onTapGesture { if player.upcoming != nil { onTap() } }
+    }
+
+    private func pill<Content: View>(progress: Double?, @ViewBuilder _ content: () -> Content) -> some View {
+        HStack(spacing: 6) { content() }
+            .font(.caption.weight(.semibold))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .frame(maxWidth: 230)
+            .overlay(alignment: .bottomLeading) {
+                if let progress {
+                    GeometryReader { proxy in
+                        Capsule().fill(.black.opacity(0.35))
+                            .frame(width: proxy.size.width * progress, height: 2)
+                            .frame(maxHeight: .infinity, alignment: .bottom)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 3)
+                }
+            }
+            .transition(.scale(scale: 0.8).combined(with: .opacity))
+    }
+}
+
+/// Tempo and key under the title, plus a lossless mark.
+private struct NowPlayingFacts: View {
+    let track: Track
+    let lossless: Bool
+    @State private var analysis: TrackAnalysis?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if let bpm = analysis?.bpm {
+                Text("\(Int(bpm.rounded())) BPM")
+                    .font(.caption.weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(.white.opacity(0.7))
+            }
+            if let key = analysis?.key { KeyBadge(key: key) }
+            if lossless {
+                Label("Lossless", systemImage: "waveform")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.7))
+            }
+        }
+        .frame(height: 18)
+        .animation(.easeOut(duration: 0.3), value: analysis?.bpm)
+        .task(id: track.id) { analysis = await TrackAnalyzer.shared.analysis(for: track.url) }
+    }
+}
+
 /// The cover keeps a fixed size; it slides with your finger to change
 /// tracks, double-tap likes, long-press opens the menu.
 private struct CoverView<MenuContent: View>: View {
@@ -308,7 +432,9 @@ private struct CoverView<MenuContent: View>: View {
             }
             .frame(width: side, height: side)
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .shadow(color: .black.opacity(0.6), radius: 20, y: 10)
+            .shadow(color: .black.opacity(player.isPlaying ? 0.55 : 0.3),
+                    radius: player.isPlaying ? 26 : 12, y: player.isPlaying ? 14 : 6)
+            .animation(.easeInOut(duration: 0.3), value: player.artwork != nil)
 
             Image(systemName: "heart.fill")
                 .font(.system(size: 90))
@@ -318,7 +444,11 @@ private struct CoverView<MenuContent: View>: View {
                 .opacity(heartBurst ? 0.95 : 0)
                 .allowsHitTesting(false)
         }
+        // Settles back slightly while paused, like Apple Music.
+        .scaleEffect(player.isPlaying ? 1 : 0.86)
+        .animation(.spring(response: 0.45, dampingFraction: 0.68), value: player.isPlaying)
         .offset(x: dragOffset)
+        .rotationEffect(.degrees(Double(dragOffset) / 40))
         .contentShape(Rectangle())
         .onTapGesture(count: 2) {
             onLike()
@@ -522,6 +652,7 @@ struct ArtworkThumbnail: View {
     @EnvironmentObject private var library: MusicLibrary
     let track: Track
     var size: CGFloat = 48
+    var cornerRadius: CGFloat?
     @State private var image: UIImage?
 
     var body: some View {
@@ -536,7 +667,7 @@ struct ArtworkThumbnail: View {
             }
         }
         .frame(width: size, height: size)
-        .clipShape(RoundedRectangle(cornerRadius: size * 0.12))
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius ?? size * 0.12, style: .continuous))
         .task(id: track.id) {
             image = await ArtworkResolver.shared.image(for: track, meta: library.meta(for: track))
         }

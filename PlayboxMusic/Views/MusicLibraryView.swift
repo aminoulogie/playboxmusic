@@ -16,6 +16,11 @@ struct MusicLibraryView: View {
 
     var body: some View {
         List {
+            if filter.isEmpty, !library.tracks.isEmpty {
+                LibraryHeader(mix: player.mix, tracks: library.tracks)
+                    .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                    .listRowSeparator(.hidden)
+            }
             if filter.isEmpty, !library.favouriteTracks.isEmpty {
                 Section("Favourites") {
                     ScrollView(.horizontal, showsIndicators: false) {
@@ -42,17 +47,19 @@ struct MusicLibraryView: View {
                         ArtworkThumbnail(track: track, size: 46)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(library.title(of: track)).font(.subheadline.weight(.semibold)).lineLimit(1)
+                                .foregroundStyle(player.current?.id == track.id ? Color.brand : .primary)
                             Text("\(library.subtitle(of: track)) · \(track.fileExtension)")
                                 .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                         }
                         Spacer()
                         if player.current?.id == track.id {
-                            Image(systemName: player.isPlaying ? "speaker.wave.2.fill" : "speaker.fill")
-                                .foregroundStyle(.tint)
+                            PlayingBars(active: player.isPlaying)
+                                .transition(.scale.combined(with: .opacity))
                         }
                     }
                 }
                 .buttonStyle(.plain)
+                .animation(.snappy, value: player.current)
                 .swipeActions {
                     Button("Delete", role: .destructive) { library.delete(track) }
                 }
@@ -81,5 +88,52 @@ struct MusicLibraryView: View {
         .navigationTitle("Library")
         .refreshable { library.reload() }
         .onAppear { library.reload() }
+    }
+}
+
+/// Spotify-style playlist header: song count, Mix and Shuffle chips and the
+/// glowing play button that plays the whole library as a mix.
+private struct LibraryHeader: View {
+    @EnvironmentObject private var player: MusicPlayer
+    @ObservedObject var mix: MixSettings
+    let tracks: [Track]
+
+    private var playingLibrary: Bool {
+        guard let current = player.current else { return false }
+        return tracks.contains(current)
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("\(tracks.count) song\(tracks.count == 1 ? "" : "s")")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Button {
+                        withAnimation(.snappy) { mix.mode = mix.isOn ? .off : .auto }
+                    } label: {
+                        ChipLabel(title: "Mix", symbol: "slider.horizontal.3", ring: mix.isOn)
+                    }
+                    Button {
+                        if !player.shuffle { player.toggleShuffle() }
+                        player.play(tracks.shuffled(), startAt: 0)
+                    } label: {
+                        ChipLabel(title: "Shuffle", symbol: "shuffle")
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
+            GlowPlayButton(isPlaying: player.isPlaying && playingLibrary) {
+                if playingLibrary {
+                    player.togglePlayback()
+                } else {
+                    player.play(tracks, startAt: 0)
+                }
+            }
+            .padding(.trailing, 6)
+        }
+        .sensoryFeedback(.selection, trigger: mix.isOn)
     }
 }
